@@ -59,6 +59,18 @@ func resolveResetOnIdle(configured *int) (time.Duration, bool) {
 	return time.Duration(defaultResetOnIdleMins) * time.Minute, true
 }
 
+// resolveAgentSessionIdleTimeout retains the common opt-in setting and gives
+// the newly resident Antigravity process an idle limit on existing configs.
+func resolveAgentSessionIdleTimeout(proj config.ProjectConfig) time.Duration {
+	if proj.AgentSessionIdleTimeoutMins != nil {
+		return time.Duration(*proj.AgentSessionIdleTimeoutMins) * time.Minute
+	}
+	if proj.Agent.Type == "antigravity" {
+		return 30 * time.Minute
+	}
+	return 0
+}
+
 // logSizeSource describes where the resolved log size came from, so the
 // caller can log it and operators can audit the active setting without
 // grepping systemd/launchd definitions.
@@ -718,14 +730,7 @@ func main() {
 			slog.Info("project: reset_on_idle_mins not set, applying default — set reset_on_idle_mins = 0 to opt out, see docs/usage.md",
 				"project", proj.Name, "default_minutes", defaultResetOnIdleMins)
 		}
-		if proj.AgentSessionIdleTimeoutMins != nil {
-			mins := *proj.AgentSessionIdleTimeoutMins
-			if mins <= 0 {
-				engine.SetAgentSessionIdleTimeout(0)
-			} else {
-				engine.SetAgentSessionIdleTimeout(time.Duration(mins) * time.Minute)
-			}
-		}
+		engine.SetAgentSessionIdleTimeout(resolveAgentSessionIdleTimeout(proj))
 
 		// Wire sender injection
 		if proj.InjectSender != nil {
@@ -1801,18 +1806,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 		slog.Info("project: reset_on_idle_mins not set, applying default — set reset_on_idle_mins = 0 to opt out, see docs/usage.md",
 			"project", proj.Name, "default_minutes", defaultResetOnIdleMins)
 	}
-	if proj.AgentSessionIdleTimeoutMins != nil {
-		mins := *proj.AgentSessionIdleTimeoutMins
-		if mins <= 0 {
-			engine.SetAgentSessionIdleTimeout(0)
-		} else {
-			engine.SetAgentSessionIdleTimeout(time.Duration(mins) * time.Minute)
-		}
-	} else {
-		// A reload may remove this option after timers were scheduled; reset
-		// explicitly so those stale idle-close timers cannot fire later.
-		engine.SetAgentSessionIdleTimeout(0)
-	}
+	engine.SetAgentSessionIdleTimeout(resolveAgentSessionIdleTimeout(*proj))
 
 	// Reload instant reply
 	if cfg.InstantReply.Enabled != nil && *cfg.InstantReply.Enabled {

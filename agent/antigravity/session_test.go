@@ -1,14 +1,19 @@
 package antigravity
 
 import (
+	"bufio"
+	"bytes"
 	"context"
-	"io"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/chenhg5/cc-connect/agent/antigravityhook"
 	"github.com/chenhg5/cc-connect/core"
 )
 
@@ -58,207 +63,244 @@ func TestNormalizeMode(t *testing.T) {
 	}
 }
 
-func TestSession_ContinueSessionTreatedAsFresh(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-
-	s, err := newAntigravitySession(context.Background(), "echo", nil, "/tmp", "", "default", core.ContinueSession, nil, 0)
-	if err != nil {
-		t.Fatalf("newAntigravitySession: %v", err)
+func TestBuildAntigravityArgs_StreamAndWrapper(t *testing.T) {
+	got := buildAntigravityArgs("agy-carbon", []string{"--verbose"}, "config-model", "plan", "sid-1", "/tmp/agy-config")
+	want := []string{"--verbose", "--gemini_dir=/tmp/agy-config", "--print-timeout=24h", "--conversation", "sid-1", "--sandbox", "--input-format", "stream-json", "--output-format", "stream-json", "-p="}
+	if !slices.Equal(got, want) {
+		t.Fatalf("args = %q, want %q", got, want)
 	}
-	defer func() { _ = s.Close() }()
-
-	if got := s.CurrentSessionID(); got != "" {
-		t.Errorf("ContinueSession should be treated as fresh: chatID = %q, want empty", got)
+	for _, tc := range []struct {
+		extra []string
+		model string
+	}{
+		{nil, "configured"}, {[]string{"--model=explicit"}, "explicit"},
+	} {
+		args := buildAntigravityArgs("/usr/bin/agy", tc.extra, "configured", "yolo", "", "")
+		if strings.Count(strings.Join(args, " "), "--model") != 1 || !strings.Contains(strings.Join(args, " "), tc.model) {
+			t.Fatalf("model args = %q, want only %q", args, tc.model)
+		}
 	}
 }
 
-func TestBuildAntigravityArgs_PromptAtEnd(t *testing.T) {
-	s, _ := newAntigravitySession(context.Background(), "echo", []string{"--verbose"}, "/tmp", "", "default", "", nil, 0)
-	args := s.buildAntigravityArgs("sid-1", true, "plan", "/tmp/agy-config", "What is 1+1?")
-	if len(args) < 2 {
-		t.Fatalf("args too short: %v", args)
+const fixtureConversationID = "00000000-0000-4000-8000-000000000001"
+
+func TestAgyHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_AGY_HELPER") != "1" {
+		return
 	}
-	if args[len(args)-2] != "-p" || args[len(args)-1] != "What is 1+1?" {
-		t.Fatalf("expected prompt to be final '-p <prompt>', got: %v", args)
+	data, err := os.ReadFile(os.Getenv("AGY_FIXTURE"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !contains(args, "--sandbox") {
-		t.Fatalf("expected --sandbox in args, got: %v", args)
+	recordings := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(recordings) != 9 {
+		t.Fatalf("unexpected fixture count: %d", len(recordings))
 	}
-	if !contains(args, "--gemini_dir=/tmp/agy-config") || !contains(args, "--print-timeout=24h") {
-		t.Fatalf("expected isolated Agy config and extended print timeout, got: %v", args)
+
+	id := fmt.Sprintf("fixture-pid-%d", os.Getpid())
+	for i, arg := range os.Args {
+		if arg == "--conversation" {
+			id = os.Args[i+1]
+		}
 	}
-	if !contains(args, "--verbose") {
-		t.Fatalf("expected configured extra args, got: %v", args)
+	printRecord := func(line string) {
+		fmt.Println(strings.ReplaceAll(line, fixtureConversationID, id))
 	}
-	if contains(args, "-m") || contains(args, "--model") {
-		t.Fatalf("did not expect model flags in args, got: %v", args)
+	in := bufio.NewScanner(os.Stdin)
+	in.Buffer(make([]byte, 4096), 1<<20)
+	for i := 0; in.Scan(); i++ {
+		var request struct {
+			Event   string
+			Message struct {
+				Role    string
+				Content []struct{ Text string }
+			}
+		}
+		if err := json.Unmarshal(in.Bytes(), &request); err != nil {
+			t.Fatal(err)
+		}
+		if request.Event != "user" || request.Message.Role != "user" || len(request.Message.Content) != 1 {
+			t.Fatalf("bad input: %s", in.Text())
+		}
+		prompt := request.Message.Content[0].Text
+		if i == 0 {
+			printRecord(recordings[0])
+		}
+		switch {
+		case strings.Contains(prompt, "CRASH-TEST"):
+			os.Exit(9)
+		case strings.Contains(prompt, "STOP-TEST"), strings.Contains(prompt, "TOPIC-HOLD"):
+			// ACK only after the subprocess has read the input and started its
+			// turn, then wait for Close (or a test-controlled release file).
+			fmt.Printf("{\"event\":\"step_update\",\"step_update\":{\"step_type\":\"agent_response\",\"text_delta\":\"started\"}}\n")
+			for {
+				if _, err := os.Stat(os.Getenv("AGY_RELEASE_FILE")); err == nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		case strings.Contains(prompt, "PERMISSION-TEST"):
+			hookInput := fmt.Sprintf(`{"conversationId":%q,"stepIdx":1,"toolCall":{"name":"view_file","args":{"AbsolutePath":"/test/fixture.txt"}}}`, id)
+			var response bytes.Buffer
+			err := antigravityhook.Relay(strings.NewReader(hookInput), &response, os.Getenv(antigravityhook.EnvAddress), os.Getenv(antigravityhook.EnvToken))
+			if err != nil || !strings.Contains(response.String(), `"decision":"allow"`) {
+				t.Fatalf("permission round-trip: %v, %s", err, response.String())
+			}
+		}
+		start, end := 1, 5
+		if i > 0 {
+			start, end = 5, 9
+		}
+		for _, record := range recordings[start:end] {
+			printRecord(record)
+		}
+	}
+	if err := in.Err(); err != nil {
+		t.Fatal(err)
+	}
+	os.Exit(0)
+}
+
+func fakeAgyArgs(t *testing.T) (string, []string, []string) {
+	t.Helper()
+	bin, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture, err := filepath.Abs("testdata/agy-1.5.12.stdout.ndjson")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bin, []string{"-test.run=^TestAgyHelperProcess$", "--"}, []string{"GO_WANT_AGY_HELPER=1", "AGY_FIXTURE=" + fixture}
+}
+
+func startFakeAgy(t *testing.T, mode, resume string) *antigravitySession {
+	t.Helper()
+	bin, args, env := fakeAgyArgs(t)
+	s, err := newAntigravitySession(context.Background(), bin, args, t.TempDir(), "", mode, resume, env, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+func nextAgyEvent(t *testing.T, s *antigravitySession) core.Event {
+	t.Helper()
+	select {
+	case event, ok := <-s.Events():
+		if !ok {
+			t.Fatal("agy session closed early")
+		}
+		return event
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for agy event")
+		return core.Event{}
+	}
+}
+
+func awaitAgyResult(t *testing.T, s *antigravitySession, want string) core.Event {
+	t.Helper()
+	var text strings.Builder
+	for {
+		event := nextAgyEvent(t, s)
+		switch event.Type {
+		case core.EventText:
+			text.WriteString(event.Content)
+		case core.EventError:
+			t.Fatal(event.Error)
+		case core.EventResult:
+			if !event.Done || event.Content != want || text.String() != want {
+				t.Fatalf("text = %q, result = %+v, want %q", text.String(), event, want)
+			}
+			return event
+		}
+	}
+}
+
+func TestAntigravitySession_ReusesProcess(t *testing.T) {
+	s := startFakeAgy(t, "yolo", core.ContinueSession)
+	if got := s.CurrentSessionID(); got != "" {
+		t.Fatalf("ContinueSession should be fresh, got %q", got)
+	}
+	pid := s.cmd.Process.Pid
+	if err := s.Send("first prompt", "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	first := awaitAgyResult(t, s, "OK-1\n")
+	if err := s.Send("second prompt", "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	second := awaitAgyResult(t, s, "OK-2\n")
+	if !s.Alive() || first.SessionID != second.SessionID || second.SessionID != fmt.Sprintf("fixture-pid-%d", pid) {
+		t.Fatalf("process/conversation changed across turns: %d, %q, %q", pid, first.SessionID, second.SessionID)
+	}
+	if first.InputTokens != 20574 || second.InputTokens != 2169 || second.CacheReadInputTokens != 18517 {
+		t.Fatalf("per-turn usage: %+v / %+v", first, second)
 	}
 }
 
 func TestAntigravitySession_ResumePassesConversationID(t *testing.T) {
-	if os.Getenv("GO_WANT_ANTIGRAVITY_HELPER") == "1" {
-		argsPath := os.Getenv("CC_ANTIGRAVITY_ARGS_FILE")
-		if argsPath == "" {
-			os.Exit(2)
-		}
-		if err := os.WriteFile(argsPath, []byte(strings.Join(os.Args, "\x00")), 0o600); err != nil {
-			os.Exit(2)
-		}
-		_, _ = io.WriteString(os.Stdout, "ok\n")
-		os.Exit(0)
+	s := startFakeAgy(t, "yolo", "conversation-1")
+	if err := s.Send("resume", "", nil, nil); err != nil {
+		t.Fatal(err)
 	}
-
-	argsPath := t.TempDir() + string(os.PathSeparator) + "args"
-	workDir := t.TempDir()
-	s, err := newAntigravitySession(
-		context.Background(),
-		os.Args[0],
-		[]string{"-test.run=TestAntigravitySession_ResumePassesConversationID", "--"},
-		workDir,
-		"",
-		"default",
-		"conversation-1",
-		[]string{
-			"GO_WANT_ANTIGRAVITY_HELPER=1",
-			"CC_ANTIGRAVITY_ARGS_FILE=" + argsPath,
-		},
-		0,
-	)
-	if err != nil {
-		t.Fatalf("newAntigravitySession: %v", err)
-	}
-	defer func() { _ = s.Close() }()
-
-	if err := s.Send("second turn", "", nil, nil); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-
-	select {
-	case event := <-s.Events():
-		if event.Type != core.EventText {
-			t.Fatalf("first event type = %q, want %q", event.Type, core.EventText)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for helper output")
-	}
-	select {
-	case event := <-s.Events():
-		if event.Type != core.EventResult || !event.Done {
-			t.Fatalf("completion event = %+v, want done EventResult", event)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for EventResult")
-	}
-
-	data, err := os.ReadFile(argsPath)
-	if err != nil {
-		t.Fatalf("read captured args: %v", err)
-	}
-	args := strings.Split(string(data), "\x00")
-	if !contains(args, "--conversation") || !contains(args, "conversation-1") {
-		t.Fatalf("resume args = %v, want --conversation conversation-1", args)
-	}
-	if !contains(args, "-p") || !contains(args, "second turn") {
-		t.Fatalf("prompt args = %v, want -p second turn", args)
+	if event := awaitAgyResult(t, s, "OK-1\n"); event.SessionID != "conversation-1" {
+		t.Fatalf("resume = %q", event.SessionID)
 	}
 }
 
-func TestDefaultModeCreatesPermissionBridge(t *testing.T) {
+func TestAntigravitySession_PermissionBridge(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-
-	s, err := newAntigravitySession(context.Background(), "echo", nil, "/tmp", "", "default", "", nil, 0)
-	if err != nil {
-		t.Fatalf("newAntigravitySession: %v", err)
-	}
-	defer func() { _ = s.Close() }()
-
+	s := startFakeAgy(t, "default", "")
 	if s.permissionBridge == nil {
-		t.Fatal("permissionBridge = nil, want default-mode permission bridge")
+		t.Fatal("missing default-mode bridge")
 	}
 	if _, err := os.Stat(filepath.Join(s.permissionBridge.AgyConfigDir(), "config", "hooks.json")); err != nil {
-		t.Fatalf("stat Agy hook overlay: %v", err)
+		t.Fatal(err)
 	}
+	if err := s.Send("PERMISSION-TEST", "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		event := nextAgyEvent(t, s)
+		if event.Type == core.EventError || event.Type == core.EventResult {
+			t.Fatalf("missing permission request: %+v", event)
+		}
+		if event.Type == core.EventPermissionRequest {
+			if event.ToolName != "view_file" || event.ToolInputRaw["AbsolutePath"] != "/test/fixture.txt" {
+				t.Fatalf("permission event = %+v", event)
+			}
+			if err := s.RespondPermission(event.RequestID, core.PermissionResult{Behavior: "allow"}); err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+	}
+	awaitAgyResult(t, s, "OK-1\n")
+	if err := s.Send("PERMISSION-TEST again", "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	event := nextAgyEvent(t, s)
+	if event.Type != core.EventPermissionRequest {
+		t.Fatalf("second permission event = %+v", event)
+	}
+	if err := s.RespondPermission(event.RequestID, core.PermissionResult{Behavior: "allow"}); err != nil {
+		t.Fatal(err)
+	}
+	awaitAgyResult(t, s, "OK-2\n")
 }
 
-func TestNonDefaultModesDoNotCreatePermissionBridge(t *testing.T) {
+func TestAntigravitySession_NonDefaultModes(t *testing.T) {
 	for _, mode := range []string{"yolo", "plan"} {
 		t.Run(mode, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir())
-
-			s, err := newAntigravitySession(context.Background(), "echo", nil, "/tmp", "", mode, "", nil, 0)
-			if err != nil {
-				t.Fatalf("newAntigravitySession: %v", err)
-			}
-			defer func() { _ = s.Close() }()
-
+			s := startFakeAgy(t, mode, "")
 			if s.permissionBridge != nil {
-				t.Fatalf("permissionBridge = %v, want nil", s.permissionBridge)
+				t.Fatal("unexpected permission bridge")
+			}
+			if err := s.RespondPermission("req", core.PermissionResult{Behavior: "allow"}); err == nil {
+				t.Fatal("unexpected permission response accepted")
 			}
 		})
 	}
-}
-
-func TestRespondPermissionRequiresDefaultMode(t *testing.T) {
-	s, err := newAntigravitySession(context.Background(), "echo", nil, "/tmp", "", "plan", "", nil, 0)
-	if err != nil {
-		t.Fatalf("newAntigravitySession: %v", err)
-	}
-	defer func() { _ = s.Close() }()
-
-	err = s.RespondPermission("req", core.PermissionResult{Behavior: "allow"})
-	if err == nil || !strings.Contains(err.Error(), "only available in default mode") {
-		t.Fatalf("RespondPermission() error = %v, want default-mode error", err)
-	}
-}
-
-func TestSendDoesNotHoldStdinOpen(t *testing.T) {
-	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
-
-	workDir := t.TempDir()
-	cmdPath := filepath.Join(t.TempDir(), "fake-agy.sh")
-	script := "#!/bin/sh\ncat >/dev/null\nprintf 'done\\n'\n"
-	if err := os.WriteFile(cmdPath, []byte(script), 0o755); err != nil {
-		t.Fatalf("WriteFile fake agy: %v", err)
-	}
-
-	s, err := newAntigravitySession(context.Background(), cmdPath, nil, workDir, "", "default", "", nil, 2*time.Second)
-	if err != nil {
-		t.Fatalf("newAntigravitySession: %v", err)
-	}
-	defer func() { _ = s.Close() }()
-
-	if err := s.Send("hello", "", nil, nil); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-
-	deadline := time.After(3 * time.Second)
-	var text strings.Builder
-	for {
-		select {
-		case ev := <-s.Events():
-			switch ev.Type {
-			case core.EventPermissionRequest:
-				t.Fatal("unexpected permission request from unstructured stdout")
-			case core.EventText:
-				text.WriteString(ev.Content)
-			case core.EventResult:
-				if !strings.Contains(text.String(), "done") {
-					t.Fatalf("text = %q, want done", text.String())
-				}
-				return
-			}
-		case <-deadline:
-			t.Fatal("timeout waiting for agy process to receive stdin EOF")
-		}
-	}
-}
-
-func contains(xs []string, want string) bool {
-	for _, x := range xs {
-		if strings.TrimSpace(x) == want {
-			return true
-		}
-	}
-	return false
 }
