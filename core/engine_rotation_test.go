@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -64,7 +65,25 @@ type rotAgentSession struct {
 	inputs     []string
 	alive      bool
 	messageIDs []string
+	// closeBlock, when set, makes Close hang like a CLI that ignores stdin EOF;
+	// ForceStop releases it unless forceIneffective is set.
+	closeBlock       chan struct{}
+	forceIneffective bool
+	forced           int
+	forceOnce        sync.Once
 }
+
+func (s *rotAgentSession) ForceStop() error {
+	s.mu.Lock()
+	s.forced++
+	block, ineffective := s.closeBlock, s.forceIneffective
+	s.mu.Unlock()
+	if block != nil && !ineffective {
+		s.forceOnce.Do(func() { close(block) })
+	}
+	return nil
+}
+func (s *rotAgentSession) forceCount() int { s.mu.Lock(); defer s.mu.Unlock(); return s.forced }
 
 func (s *rotAgentSession) Send(text, id string, _ []ImageAttachment, _ []FileAttachment) error {
 	s.mu.Lock()
@@ -80,7 +99,18 @@ func (s *rotAgentSession) RespondPermission(string, PermissionResult) error { re
 func (s *rotAgentSession) Events() <-chan Event                             { return s.events }
 func (s *rotAgentSession) CurrentSessionID() string                         { return s.id }
 func (s *rotAgentSession) Alive() bool                                      { s.mu.Lock(); defer s.mu.Unlock(); return s.alive }
-func (s *rotAgentSession) Close() error                                     { s.mu.Lock(); s.alive = false; s.mu.Unlock(); return nil }
+func (s *rotAgentSession) Close() error {
+	s.mu.Lock()
+	block := s.closeBlock
+	s.mu.Unlock()
+	if block != nil {
+		<-block
+	}
+	s.mu.Lock()
+	s.alive = false
+	s.mu.Unlock()
+	return nil
+}
 func (s *rotAgentSession) sent() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -409,7 +439,13 @@ func TestRotationCommitFailureProcessesQueueOnSource(t *testing.T) {
 	e.ReceiveMessage(p, &Message{Platform: "test", SessionKey: "test:chat:user", Content: "KEEP_ORIGINAL_QUEUE", ReplyCtx: "chat"})
 	a.at(0).events <- Event{Type: EventResult, Done: true, Content: "A_DONE"}
 	rotWait(t, func() bool { return a.count() == 2 })
-	bad := t.TempDir()
+	// Not t.TempDir: the engine may still be persisting into it after the
+	// wake-up turn when the test returns, which fails TempDir's cleanup.
+	bad, err := os.MkdirTemp("", "rot-commit-fail-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.cancel(); time.Sleep(20 * time.Millisecond); _ = os.RemoveAll(bad) })
 	e.sessions.mu.Lock()
 	e.sessions.storePath = bad
 	e.sessions.mu.Unlock()
@@ -421,9 +457,19 @@ func TestRotationCommitFailureProcessesQueueOnSource(t *testing.T) {
 	a.mu.Lock()
 	resumed := a.resumeIDs[2]
 	a.mu.Unlock()
-	if resumed != "backend-0" || !strings.Contains(a.at(2).sent()[0], "KEEP_ORIGINAL_QUEUE") || strings.Contains(a.at(2).sent()[0], "FAILED_HANDOFF") {
-		t.Fatal("queue not resumed on original context")
+	// The failure wake-up goes first, then the user's queued message, on the source.
+	first := a.at(2).sent()[0]
+	if resumed != "backend-0" || !strings.Contains(first, "session switch failed") || strings.Contains(first, "FAILED_HANDOFF") {
+		t.Fatalf("wake-up not resumed on original context: %q", a.at(2).sent())
 	}
+	rotWait(t, func() bool {
+		for _, in := range a.at(2).sent() {
+			if strings.Contains(in, "KEEP_ORIGINAL_QUEUE") {
+				return true
+			}
+		}
+		return false
+	})
 	op, _ := e.sessions.Rotation("fail-write")
 	if op.Status != "FAILED" {
 		t.Fatal("failed receipt left scheduled", op)
@@ -542,4 +588,143 @@ func TestRotationPreviewFreezeReceipt(t *testing.T) {
 			}
 		})
 	}
+}
+
+func rotShortCloseWaits(t *testing.T) {
+	t.Helper()
+	oldClose, oldForce := rotationCloseWait, rotationForceWait
+	rotationCloseWait, rotationForceWait = 20*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { rotationCloseWait, rotationForceWait = oldClose, oldForce })
+}
+
+func rotSentContains(p *rotPlatform, sub string) bool {
+	for _, m := range p.getSent() {
+		if strings.Contains(m, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// 11-21 VPS: the source CLI did not exit within the rotation's close wait after
+// stdin EOF, so the switch was abandoned with "old session close timed out".
+// The source must be force-stopped and the handoff delivered to the new session.
+func TestRotationCloseTimeoutForceStopsAndDeliversHandoff(t *testing.T) {
+	rotShortCloseWaits(t)
+	e, a, p, old := rotStart(t)
+	src := a.at(0)
+	block := make(chan struct{})
+	src.mu.Lock()
+	src.closeBlock = block
+	src.mu.Unlock()
+	t.Cleanup(func() { src.forceOnce.Do(func() { close(block) }) })
+	if _, err := e.ScheduleRotation(RotateRequest{SessionKey: "test:chat:user", ExpectedSessionID: old.ID, RequestID: "slow-close", Handoff: "NEW_HANDOFF"}); err != nil {
+		t.Fatal(err)
+	}
+	src.events <- Event{Type: EventResult, Done: true, Content: "A_DONE"}
+	rotWait(t, func() bool {
+		op, _ := e.sessions.Rotation("slow-close")
+		return op.Status == "SWITCHED" || op.Status == "FAILED"
+	})
+	op, _ := e.sessions.Rotation("slow-close")
+	if op.Status != "SWITCHED" {
+		t.Fatalf("slow source close abandoned the switch: status=%s reason=%q sent=%q", op.Status, op.Error, p.getSent())
+	}
+	rotWait(t, func() bool { c := a.at(1); return c != nil && len(c.sent()) > 0 })
+	if !strings.Contains(a.at(1).sent()[0], "NEW_HANDOFF") {
+		t.Fatalf("new session did not receive the handoff: %q", a.at(1).sent())
+	}
+	if src.forceCount() == 0 {
+		t.Fatal("source was not force-stopped")
+	}
+	if e.sessions.LookupActive("test:chat:user") == old {
+		t.Fatal("source still active after switch")
+	}
+	rotWait(t, func() bool { return rotSentContains(p, "Session switched") })
+}
+
+// Any failed switch must be loud: a chat notice, the alert command, and a
+// wake-up message actually delivered to the retained source conversation.
+func TestRotationFailureAlertsAndWakesSource(t *testing.T) {
+	e, a, p, old := rotStart(t)
+	src := a.at(0)
+	var alertMu sync.Mutex
+	var alerts []string
+	e.rotationAlert = func(key, text string) {
+		alertMu.Lock()
+		alerts = append(alerts, key+" "+text)
+		alertMu.Unlock()
+	}
+	a.mu.Lock()
+	a.startErr = fmt.Errorf("spawn refused")
+	a.mu.Unlock()
+	if _, err := e.ScheduleRotation(RotateRequest{SessionKey: "test:chat:user", ExpectedSessionID: old.ID, RequestID: "spawn-fail", Handoff: "LOST_HANDOFF"}); err != nil {
+		t.Fatal(err)
+	}
+	src.events <- Event{Type: EventResult, Done: true, Content: "A_DONE"}
+	rotWait(t, func() bool { op, _ := e.sessions.Rotation("spawn-fail"); return op.Status == "FAILED" })
+	rotWait(t, func() bool { return rotSentContains(p, "Session switch failed") })
+	rotWait(t, func() bool {
+		alertMu.Lock()
+		defer alertMu.Unlock()
+		return len(alerts) == 1 && strings.Contains(alerts[0], "test:chat:user") && strings.Contains(alerts[0], "spawn refused")
+	})
+	// The wake-up is injected into the source conversation (not the lost handoff).
+	rotWait(t, func() bool {
+		for _, in := range src.sent() {
+			if strings.Contains(in, "session switch failed") && strings.Contains(in, "spawn-fail") {
+				return true
+			}
+		}
+		return false
+	})
+	for _, in := range src.sent() {
+		if strings.Contains(in, "LOST_HANDOFF") {
+			t.Fatal("failed handoff replayed into source")
+		}
+	}
+	if e.sessions.LookupActive("test:chat:user") != old {
+		t.Fatal("failed switch replaced source")
+	}
+}
+
+// Force stop that does not make the process exit must fail loudly and wake the source.
+func TestRotationForceStopIneffectiveFailsLoudly(t *testing.T) {
+	rotShortCloseWaits(t)
+	e, a, p, old := rotStart(t)
+	src := a.at(0)
+	block := make(chan struct{})
+	src.mu.Lock()
+	src.closeBlock = block
+	src.forceIneffective = true
+	src.mu.Unlock()
+	t.Cleanup(func() { src.forceOnce.Do(func() { close(block) }) })
+	var alertMu sync.Mutex
+	alerted := 0
+	e.rotationAlert = func(_, _ string) { alertMu.Lock(); alerted++; alertMu.Unlock() }
+	if _, err := e.ScheduleRotation(RotateRequest{SessionKey: "test:chat:user", ExpectedSessionID: old.ID, RequestID: "stuck", Handoff: "STUCK_HANDOFF"}); err != nil {
+		t.Fatal(err)
+	}
+	src.events <- Event{Type: EventResult, Done: true, Content: "A_DONE"}
+	rotWait(t, func() bool { op, _ := e.sessions.Rotation("stuck"); return op.Status == "FAILED" })
+	rotWait(t, func() bool { return rotSentContains(p, "Session switch failed") })
+	rotWait(t, func() bool { alertMu.Lock(); defer alertMu.Unlock(); return alerted == 1 })
+	if src.forceCount() == 0 {
+		t.Fatal("force stop not attempted")
+	}
+	if e.sessions.LookupActive("test:chat:user") != old {
+		t.Fatal("stuck source replaced")
+	}
+}
+
+func TestRotationAlertCommandReceivesEnv(t *testing.T) {
+	e := NewEngine("alert-proj", &rotAgent{}, nil, "", LangEnglish)
+	t.Cleanup(func() { e.cancel() })
+	out := t.TempDir() + "/alert.txt"
+	e.SetRotationAlertCommand([]string{"sh", "-c", `printf '%s|%s|%s' "$CC_PROJECT" "$CC_SESSION_KEY" "$CC_ALERT_TEXT" > "$0"`, out})
+	e.rotationAlert("feishu:oc_x:ou_y", "boom")
+	rotWait(t, func() bool {
+		b, err := os.ReadFile(out)
+		return err == nil && string(b) == "alert-proj|feishu:oc_x:ou_y|boom"
+	})
 }

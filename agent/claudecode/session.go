@@ -1189,6 +1189,32 @@ func (cs *claudeSession) Alive() bool {
 	return cs.alive.Load()
 }
 
+// ForceStop terminates the process group without waiting for a graceful
+// stdin-EOF exit: SIGTERM, then SIGKILL after 5s. Safe to call concurrently
+// with Close; both return once the process has exited.
+func (cs *claudeSession) ForceStop() error {
+	if err := signalProcessGroup(cs.cmd, syscall.SIGTERM); err != nil {
+		slog.Warn("claudeSession: force stop SIGTERM", "error", err)
+	}
+	select {
+	case <-cs.done:
+		slog.Info("claudeSession: exited after force stop SIGTERM")
+		return nil
+	case <-time.After(5 * time.Second):
+		slog.Warn("claudeSession: force stop SIGTERM timed out, sending SIGKILL")
+	}
+	cs.cancel()
+	if err := forceKillCmd(cs.cmd); err != nil {
+		slog.Warn("claudeSession: force stop kill", "error", err)
+	}
+	select {
+	case <-cs.done:
+		return nil
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("claude process did not exit after SIGKILL")
+	}
+}
+
 func (cs *claudeSession) Close() error {
 	// Best-effort cleanup of the --append-system-prompt-file temp file on
 	// every exit path. The file is small (~9KB) and OS temp cleanup also

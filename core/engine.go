@@ -361,6 +361,7 @@ type Engine struct {
 	rotationGeneration    map[string]uint64
 	rotationMu            sync.Mutex
 	rotationWorkers       map[string]bool
+	rotationAlert         func(sessionKey, text string)
 	sessionSpawnMu        sync.Mutex
 	name                  string
 	agent                 Agent

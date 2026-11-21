@@ -1,10 +1,12 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -13,6 +15,77 @@ import (
 var ErrRotationNativeBusy = errors.New("session new refused: native work remains")
 
 type rotationTurnOutcome struct{ Complete, Delivered bool }
+
+// ForceStopper is implemented by agent sessions that can be terminated without
+// waiting for a graceful exit. Rotation only uses it after the source turn has
+// completed and graceful close did not finish in time.
+type ForceStopper interface{ ForceStop() error }
+
+// Rotation waits this long for a graceful close, then force-stops the source
+// process and waits rotationForceWait for it to exit. Variables for tests.
+var (
+	rotationCloseWait = 30 * time.Second
+	rotationForceWait = 15 * time.Second
+)
+
+// SetRotationAlertCommand runs argv (no shell) whenever a session switch fails,
+// with CC_PROJECT, CC_SESSION_KEY, CC_ROTATION_REQUEST_ID and CC_ALERT_TEXT in
+// the environment. It lets deployments post the alert through another bot
+// identity so that agents in the group actually see it.
+func (e *Engine) SetRotationAlertCommand(argv []string) {
+	if len(argv) == 0 {
+		e.rotationAlert = nil
+		return
+	}
+	argv = append([]string(nil), argv...)
+	e.rotationAlert = func(sessionKey, text string) {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+			cmd.Env = append(os.Environ(), "CC_PROJECT="+e.name, "CC_SESSION_KEY="+sessionKey, "CC_ALERT_TEXT="+text)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				slog.Error("rotation alert command failed", "session", sessionKey, "error", err, "output", strings.TrimSpace(string(out)))
+				return
+			}
+			slog.Info("rotation alert command sent", "session", sessionKey)
+		}()
+	}
+}
+
+// reportRotationFailure makes a failed switch visible and wakes the retained
+// source conversation: a plain notice in the chat (retried once), the optional
+// alert command, and a wake-up message queued at the front of the source FIFO
+// so the agent continues instead of waiting for a handoff that never arrives.
+func (e *Engine) reportRotationFailure(state *interactiveState, ccKey string, op RotationOperation, reason string) {
+	text := e.i18n.Tf(MsgRotationFailed, reason)
+	state.mu.Lock()
+	p, rc := state.platform, state.replyCtx
+	state.mu.Unlock()
+	if p != nil {
+		if err := p.Send(e.ctx, rc, text); err != nil {
+			slog.Error("rotation failure notice failed; retrying", "request_id", op.RequestID, "error", err)
+			if err := p.Send(e.ctx, rc, text); err != nil {
+				slog.Error("rotation failure notice retry failed", "request_id", op.RequestID, "error", err)
+			}
+		}
+	}
+	if e.rotationAlert != nil {
+		e.rotationAlert(ccKey, fmt.Sprintf("[cc-connect %s] %s (session=%s request_id=%s)", e.name, text, ccKey, op.RequestID))
+	}
+	wake := fmt.Sprintf("[cc-connect] session switch failed (request_id=%s): %s. Your current conversation was kept and the handoff was NOT delivered to a new session. Continue the work here; run `cc-connect session new --handoff` again if you still need a fresh session.\n[cc-connect] 会话切换失败（request_id=%s）：%s。当前会话已保留，交接没有投递到新会话。请在本会话继续工作；仍需换新就重新执行 cc-connect session new --handoff。", op.RequestID, reason, op.RequestID, reason)
+	state.mu.Lock()
+	if !state.stopped {
+		q := queuedMessage{platform: p, replyCtx: rc, content: wake, msgSessionKey: ccKey}
+		if p != nil {
+			q.msgPlatform = p.Name()
+		}
+		state.pendingMessages = append([]queuedMessage{q}, state.pendingMessages...)
+	}
+	state.mu.Unlock()
+	slog.Warn("rotation failure reported; source conversation will be woken", "request_id", op.RequestID, "session", ccKey, "reason", reason)
+}
 
 // FreshSessionValidator rejects CLI arguments that could override a fresh start.
 type FreshSessionValidator interface{ ValidateFreshSession() error }
@@ -129,6 +202,10 @@ func (e *Engine) dispatchReservedRotation(old *Session, sm *SessionManager, key,
 	}
 	e.interactiveMu.Unlock()
 	_, err := e.runLatestRotation(state, old, sm, key, route, op)
+	if err != nil && err != ErrRotationStale {
+		slog.Error("session rotation failed", "request_id", op.RequestID, "error", err)
+		e.reportRotationFailure(state, route, op, err.Error())
+	}
 	updated, _ := sm.Rotation(op.RequestID)
 	return updated, err
 }
@@ -144,22 +221,20 @@ func (e *Engine) finishScheduledRotation(state *interactiveState, old *Session, 
 	}
 	state.mu.Lock()
 	outcome := state.rotationOutcome
-	p := state.platform
-	rc := state.replyCtx
 	state.mu.Unlock()
 	if !outcome.Complete || !outcome.Delivered {
 		reason := "turn or final reply delivery was not confirmed; old conversation retained"
 		if err := sm.FinishRotation(op.RequestID, "FAILED", reason); err != nil {
 			slog.Error("rotation failure receipt", "error", err)
 		}
-		_ = p.Send(e.ctx, rc, e.i18n.Tf(MsgRotationFailed, reason))
+		e.reportRotationFailure(state, ccKey, op, reason)
 		return false
 	}
 	committed, err := e.runLatestRotation(state, old, sm, key, ccKey, op)
 
 	if err != nil {
 		slog.Error("session rotation failed", "request_id", op.RequestID, "error", err)
-		_ = p.Send(e.ctx, rc, e.i18n.Tf(MsgRotationFailed, err))
+		e.reportRotationFailure(state, ccKey, op, err.Error())
 	}
 	return committed
 }
@@ -259,10 +334,28 @@ func (e *Engine) performRotation(state *interactiveState, old *Session, sm *Sess
 		go func() { closed <- oldAS.Close() }()
 		select {
 		case err = <-closed:
-		case <-time.After(30 * time.Second):
+		case <-time.After(rotationCloseWait):
 			err = fmt.Errorf("old session close timed out")
 		case <-e.ctx.Done():
 			err = e.ctx.Err()
+		}
+		// The source turn is complete, so a process that ignores stdin EOF
+		// (background tasks, slow hooks) is force-stopped instead of aborting
+		// the switch while Close keeps killing it in the background anyway.
+		if fs, ok := oldAS.(ForceStopper); ok && err != nil && e.ctx.Err() == nil {
+			slog.Warn("rotation: old session did not exit after stdin close; force stopping", "request_id", op.RequestID, "wait", rotationCloseWait)
+			go func() {
+				if ferr := fs.ForceStop(); ferr != nil {
+					slog.Warn("rotation: force stop", "request_id", op.RequestID, "error", ferr)
+				}
+			}()
+			select {
+			case err = <-closed:
+			case <-time.After(rotationForceWait):
+				err = fmt.Errorf("old session close timed out (also after force stop)")
+			case <-e.ctx.Done():
+				err = e.ctx.Err()
+			}
 		}
 		if err != nil {
 			discard()
