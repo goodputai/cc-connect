@@ -9,7 +9,76 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
+
+// Session history is display/bookkeeping only (the agent keeps the real
+// transcript), but the whole store is rewritten under sm.mu on every Save, so
+// its size is bounded. Variables so tests can override them.
+var (
+	// historyMaxEntries keeps only the last N entries per session.
+	historyMaxEntries = 50
+	// historyMaxEntryBytes caps each stored entry's Content (including the
+	// truncation marker, so re-applying it is a no-op).
+	historyMaxEntryBytes = 4000
+	// historyRetainActiveFor: History is dropped (on load and in every saved
+	// snapshot) for sessions that are not active for any key, and for active
+	// sessions not updated for this long. Session records are kept.
+	historyRetainActiveFor = 48 * time.Hour
+)
+
+// historyTruncateReserve leaves room for the truncation marker.
+const historyTruncateReserve = 40
+
+// truncateHistoryContent cuts content to at most historyMaxEntryBytes bytes on
+// a rune boundary, appending a marker with the number of dropped bytes.
+func truncateHistoryContent(content string) string {
+	limit := historyMaxEntryBytes
+	if limit <= 0 || len(content) <= limit {
+		return content
+	}
+	cut := limit - historyTruncateReserve
+	if cut < 0 {
+		cut = 0
+	}
+	for cut > 0 && !utf8.RuneStart(content[cut]) {
+		cut--
+	}
+	return content[:cut] + fmt.Sprintf("…[truncated %d bytes]", len(content)-cut)
+}
+
+// trimHistoryLocked applies the entry-count and entry-size caps.
+// Caller holds s.mu or owns s exclusively.
+func (s *Session) trimHistoryLocked() {
+	if n := historyMaxEntries; n > 0 && len(s.History) > n {
+		s.History = append([]HistoryEntry(nil), s.History[len(s.History)-n:]...)
+	}
+	for i := range s.History {
+		s.History[i].Content = truncateHistoryContent(s.History[i].Content)
+	}
+}
+
+// boundHistories trims every session's history and drops it entirely for
+// sessions that are not active (by activeSession values) or are active but
+// idle longer than historyRetainActiveFor. Caller owns the sessions (load) or
+// passes snapshot clones.
+func boundHistories(sessions map[string]*Session, activeSession map[string]string, now time.Time) {
+	active := make(map[string]bool, len(activeSession))
+	for _, id := range activeSession {
+		active[id] = true
+	}
+	for id, s := range sessions {
+		if s == nil {
+			continue
+		}
+		stale := !s.UpdatedAt.IsZero() && now.Sub(s.UpdatedAt) > historyRetainActiveFor
+		if !active[id] || stale {
+			s.History = nil
+			continue
+		}
+		s.trimHistoryLocked()
+	}
+}
 
 // ContinueSession is a sentinel value for AgentSessionID that tells the agent
 // to use --continue (resume most recent session) instead of a specific session ID.
@@ -44,6 +113,9 @@ type Session struct {
 	retirement        *sync.Map
 	mu                sync.Mutex `json:"-"`
 	busy              bool       `json:"-"`
+	// historyAdded counts AddHistory calls (not persisted). Unlike
+	// len(History) it keeps growing once the entry cap is reached.
+	historyAdded uint64
 }
 
 func (s *Session) TryLock() bool {
@@ -86,9 +158,22 @@ func (s *Session) AddHistory(role, content string) {
 	defer s.mu.Unlock()
 	s.History = append(s.History, HistoryEntry{
 		Role:      role,
-		Content:   content,
+		Content:   truncateHistoryContent(content),
 		Timestamp: time.Now(),
 	})
+	if n := historyMaxEntries; n > 0 && len(s.History) > n {
+		s.History = s.History[len(s.History)-n:]
+	}
+	s.historyAdded++
+}
+
+// HistoryAddedCount returns how many entries were ever added in this process
+// (monotonic; use it for "did this turn add entries" checks, since
+// len(History) stops growing at historyMaxEntries).
+func (s *Session) HistoryAddedCount() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.historyAdded
 }
 
 // recordPastAgentSessionID saves the current AgentSessionID to PastAgentSessionIDs
@@ -247,6 +332,12 @@ func (s *Session) ClearHistory() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.History = nil
+}
+
+// hasAgentBindingLocked reports whether the session has (or had) an agent
+// session ID that it can be resumed or switched to. Caller holds s.mu.
+func (s *Session) hasAgentBindingLocked() bool {
+	return (s.AgentSessionID != "" && s.AgentSessionID != ContinueSession) || len(s.PastAgentSessionIDs) > 0
 }
 
 // HistoryLen returns the current number of history entries.
@@ -728,6 +819,7 @@ func (sm *SessionManager) load() {
 	for _, s := range sm.sessions {
 		s.stripContinueSessionSentinel()
 	}
+	boundHistories(sm.sessions, sm.activeSession, time.Now())
 
 	slog.Info("session: loaded from disk", "path", sm.storePath, "sessions", len(sm.sessions))
 }
@@ -867,10 +959,13 @@ func (sm *SessionManager) PruneDuplicateSessions(mergeHistory bool) PruneResult 
 			old.mu.Lock()
 			hasHistory := len(old.History) > 0
 			oldHistoryLen := len(old.History)
+			resumable := old.hasAgentBindingLocked()
 			old.mu.Unlock()
 
-			// When not merging: only remove empty sessions
-			if !mergeHistory && hasHistory {
+			// When not merging: only remove empty sessions. History of
+			// non-active sessions is dropped on save/load, so a backend binding
+			// also counts as content (keeps /switch and --resume working).
+			if !mergeHistory && (hasHistory || resumable) {
 				continue // Keep sessions with history when not merging
 			}
 
@@ -935,7 +1030,9 @@ func (sm *SessionManager) PruneEmptySessions() int {
 	removed := 0
 	for _, s := range sm.sessions {
 		s.mu.Lock()
-		isEmpty := len(s.History) == 0
+		// History of non-active sessions is dropped on save/load; a backend
+		// binding means the session is still resumable, so it is not empty.
+		isEmpty := len(s.History) == 0 && !s.hasAgentBindingLocked()
 		s.mu.Unlock()
 
 		if isEmpty {
