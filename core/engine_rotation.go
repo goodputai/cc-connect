@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,6 +28,15 @@ var (
 	rotationCloseWait = 30 * time.Second
 	rotationForceWait = 15 * time.Second
 )
+
+// rotationTurnStallTimeout: a foreground turn that produces no events for this
+// long while a session switch is pending is ended (like the general event idle
+// timeout), so the switch converges to FAILED/committed instead of staying
+// SCHEDULED until the much longer event idle timeout. Atomic so tests can
+// shorten it while engine goroutines from other turns are still running.
+var rotationTurnStallTimeout atomic.Int64
+
+func init() { rotationTurnStallTimeout.Store(int64(10 * time.Minute)) }
 
 // SetRotationAlertCommand runs argv (no shell) whenever a session switch fails,
 // with CC_PROJECT, CC_SESSION_KEY, CC_ROTATION_REQUEST_ID and CC_ALERT_TEXT in
