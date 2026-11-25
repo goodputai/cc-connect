@@ -1650,15 +1650,16 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		if workspaceDir != "" {
 			iKey = workspaceDir + ":" + iKey
 		}
-		prevHistLen := session.HistoryLen()
+		prevHistAdded := session.HistoryAddedCount()
 		e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey)
 		e.cleanupInteractiveState(iKey)
 		// Empty-response detection via session history delta: processInteractiveMessageWith
-		// always adds a "user" entry (prevHistLen+1), then an "assistant" entry on success
-		// (prevHistLen+2). This approach correctly detects empty responses across all
+		// always adds a "user" entry (+1), then an "assistant" entry on success
+		// (+2). HistoryAddedCount is used rather than HistoryLen because the
+		// stored history is capped at historyMaxEntries. This approach correctly detects empty responses across all
 		// delivery modes (plain text, cards, rich cards, DingTalk AI streaming) because
 		// AddHistory("assistant",...) is called before any platform-specific rendering path.
-		if !job.Mute && session.HistoryLen() < prevHistLen+2 {
+		if !job.Mute && session.HistoryAddedCount() < prevHistAdded+2 {
 			return fmt.Errorf("cron job %q produced an empty response", job.ID)
 		}
 		return nil
@@ -1673,10 +1674,10 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		return e.queueScheduledForBusySession(effectivePlatform, msg, session, sessions, iKey, agent, workspaceDir)
 	}
 
-	prevHistLen := session.HistoryLen()
+	prevHistAdded := session.HistoryAddedCount()
 	e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey)
 	// Same empty-response detection as the useNewSession path above.
-	if !job.Mute && session.HistoryLen() < prevHistLen+2 {
+	if !job.Mute && session.HistoryAddedCount() < prevHistAdded+2 {
 		return fmt.Errorf("cron job %q produced an empty response", job.ID)
 	}
 	return nil

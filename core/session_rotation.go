@@ -90,6 +90,7 @@ func (sm *SessionManager) snapshotLocked() sessionSnapshot {
 	for k, v := range sm.activeSession {
 		snap.ActiveSession[k] = v
 	}
+	boundHistories(snap.Sessions, snap.ActiveSession, time.Now())
 	for k, v := range sm.userSessions {
 		snap.UserSessions[k] = append([]string(nil), v...)
 	}
@@ -128,7 +129,7 @@ func (sm *SessionManager) writeSnapshotLocked(snap sessionSnapshot) error {
 	if sm.storePath == "" {
 		return nil
 	}
-	data, err := json.MarshalIndent(snap, "", "  ")
+	data, err := json.Marshal(snap)
 	if err != nil {
 		return fmt.Errorf("marshal sessions: %w", err)
 	}
