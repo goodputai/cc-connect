@@ -167,7 +167,7 @@ func TestSessionSave_DropsHistoryOfInactiveSessions(t *testing.T) {
 			History        []HistoryEntry `json:"history"`
 		} `json:"sessions"`
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := ReadSessionStoreJSON(path)
 	if err != nil {
 		t.Fatal(err)
 	}
