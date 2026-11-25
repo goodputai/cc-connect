@@ -70,7 +70,7 @@ func runSessions(args []string) {
 			printSessionsUsage()
 			return
 		default:
-			if subcommand == "" && (args[i] == "list" || args[i] == "show" || args[i] == "prune") {
+			if subcommand == "" && (args[i] == "list" || args[i] == "show" || args[i] == "prune" || args[i] == "export-legacy") {
 				subcommand = args[i]
 			} else {
 				positional = append(positional, args[i])
@@ -132,6 +132,12 @@ func runSessions(args []string) {
 			mergeHistory = false
 		}
 		runSessionsPrune(dataDir, project, mergeHistory)
+	case "export-legacy":
+		var project string
+		if len(positional) > 0 {
+			project = positional[0]
+		}
+		runSessionsExportLegacy(dataDir, project)
 	default:
 		// Default: launch TUI
 		runSessionsTUI(dataDir)
@@ -167,7 +173,8 @@ func loadAllSessions(dataDir string) ([]sessionRecord, error) {
 		project := strings.TrimSuffix(entry.Name(), ".json")
 		filePath := filepath.Join(sessionsDir, entry.Name())
 
-		data, err := os.ReadFile(filePath)
+		// Either store layout, rendered in the single-file shape.
+		data, err := core.ReadSessionStoreJSON(filePath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: cannot read %s: %v\n", entry.Name(), err)
 			continue
@@ -418,6 +425,37 @@ func truncate(s string, maxLen int) string {
 	return string(runes[:maxLen-3]) + "..."
 }
 
+// runSessionsExportLegacy rewrites split session stores in the legacy
+// single-file format (rollback to a binary without the split layout).
+// Stop cc-connect first.
+func runSessionsExportLegacy(dataDir, project string) {
+	sessionsDir := filepath.Join(dataDir, "sessions")
+	entries, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	failed := false
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		if project != "" && strings.TrimSuffix(entry.Name(), ".json") != project {
+			continue
+		}
+		path := filepath.Join(sessionsDir, entry.Name())
+		if err := core.ExportLegacySessionStore(path); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %s: %v\n", entry.Name(), err)
+			failed = true
+			continue
+		}
+		fmt.Printf("exported %s\n", entry.Name())
+	}
+	if failed {
+		os.Exit(1)
+	}
+}
+
 func printSessionsUsage() {
 	fmt.Println(`Usage: cc-connect sessions [command] [options]
 
@@ -428,6 +466,8 @@ Commands:
   list               List all sessions (pipe-friendly)
   show <id> [-n N]   Show session messages
   prune [project] [--merge]  Remove duplicate sessions per chat
+  export-legacy [project]    Rewrite stores in the pre-split single-file
+                             format (rollback; stop cc-connect first)
 
 Options:
   --data-dir <path>  Data directory (default: ~/.cc-connect)

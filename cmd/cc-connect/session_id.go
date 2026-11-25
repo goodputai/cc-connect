@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/chenhg5/cc-connect/core"
 )
 
 func runAgentSID(args []string) {
@@ -191,7 +193,7 @@ func isHex(s string) bool {
 //   - ("", 0, false, nil)         — key not in this file, or file unreadable/malformed (skip)
 //   - ("", 0, false, err)         — key found but agent ID unavailable (definitive error)
 func readAgentSessionID(path, sessionKey string) (string, int64, bool, error) {
-	data, err := os.ReadFile(path)
+	data, err := core.ReadSessionStoreJSON(path)
 	if err != nil {
 		return "", 0, false, nil // file unreadable, skip
 	}

@@ -1,7 +1,6 @@
 package core
 
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -385,6 +384,10 @@ type sessionSnapshot struct {
 	Rotations       map[string]*RotationOperation `json:"rotations,omitempty"`
 	RetiredAgentIDs map[string]bool               `json:"retired_agent_ids,omitempty"`
 	Version         int                           `json:"version,omitempty"` // schema version for migration detection
+	// Split layout (see session_store.go): sessions live in per-session files.
+	Layout        string            `json:"layout,omitempty"`
+	SessionFiles  map[string]string `json:"session_files,omitempty"`
+	RotationsFile string            `json:"rotations_file,omitempty"`
 }
 
 // SessionManager supports multiple named sessions per user with active-session tracking.
@@ -407,6 +410,15 @@ type SessionManager struct {
 	// may have lost their AgentSessionID through /new or provider switches.
 	// KnownAgentSessionIDs returns nil to disable filterOwnedSessions.
 	legacyData bool
+
+	// Split-store write cache (guarded by mu): file name per session as
+	// committed on disk, and the last committed meta bytes.
+	storeFiles map[string]string
+	storeMeta  []byte
+	storeWrite func(path string, data []byte, perm os.FileMode) error // test hook
+	// committed rotations file and the fingerprint of its content
+	storeRotFile string
+	storeRotFP   [32]byte
 }
 
 func NewSessionManager(storePath string) *SessionManager {
@@ -760,18 +772,16 @@ func (sm *SessionManager) saveLocked() error {
 }
 
 func (sm *SessionManager) load() {
-	data, err := os.ReadFile(sm.storePath)
+	snap, raw, loadedFiles, rotFile, err := readSessionStoreFull(sm.storePath)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			slog.Error("session: failed to read", "path", sm.storePath, "error", err)
+			slog.Error("session: failed to load", "path", sm.storePath, "error", err)
 		}
 		return
 	}
-	var snap sessionSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
-		slog.Error("session: failed to unmarshal", "path", sm.storePath, "error", err)
-		return
-	}
+	split := snap.Layout == sessionStoreLayoutSplit
+	// Fingerprint what is on disk before recoverRotationsLocked edits it.
+	rotFP := rotationsFingerprint(snap.Rotations)
 	sm.sessions = snap.Sessions
 	sm.activeSession = snap.ActiveSession
 	sm.userSessions = snap.UserSessions
@@ -821,7 +831,26 @@ func (sm *SessionManager) load() {
 	}
 	boundHistories(sm.sessions, sm.activeSession, time.Now())
 
-	slog.Info("session: loaded from disk", "path", sm.storePath, "sessions", len(sm.sessions))
+	if split {
+		sm.storeFiles = loadedFiles
+		sm.storeMeta = raw
+		if rotFile != "" {
+			sm.storeRotFile, sm.storeRotFP = rotFile, rotFP
+		}
+		removeOrphanSessionFiles(sm.storePath, loadedFiles, rotFile)
+	} else if len(sm.sessions) > 0 {
+		// Legacy single-file store: keep its bytes, then write the split layout.
+		bak := sm.storePath + ".pre-split.bak"
+		if err := AtomicWriteFile(bak, raw, 0o600); err != nil {
+			slog.Error("session: keep legacy store before split", "path", bak, "error", err)
+		} else if err := sm.saveLocked(); err != nil {
+			slog.Error("session: migrate to split layout", "path", sm.storePath, "error", err)
+		} else {
+			slog.Info("session: migrated store to split layout", "path", sm.storePath, "backup", bak, "sessions", len(sm.sessions))
+		}
+	}
+
+	slog.Info("session: loaded from disk", "path", sm.storePath, "sessions", len(sm.sessions), "split", split)
 }
 
 // InvalidateForAgent clears AgentSessionID on all sessions whose AgentType
