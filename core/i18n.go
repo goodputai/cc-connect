@@ -174,6 +174,7 @@ const (
 	MsgToolResultFmtFailed       MsgKey = "tool_result_fmt_failed"
 	MsgExecutionStopped          MsgKey = "execution_stopped"
 	MsgFinalReplyComplete        MsgKey = "final_reply_complete"
+	MsgTurnFailedNotice          MsgKey = "turn_failed_notice"
 	MsgSessionCancelled          MsgKey = "session_cancelled"
 	MsgNoExecution               MsgKey = "no_execution"
 	MsgPreviousProcessing        MsgKey = "previous_processing"
@@ -720,6 +721,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "failed",
 		LangJapanese:           "failed",
 		LangSpanish:            "fallido",
+	},
+	MsgTurnFailedNotice: {
+		LangEnglish:            "This turn failed. See the error above.",
+		LangChinese:            "本轮执行失败，请查看上方错误。",
+		LangTraditionalChinese: "本輪執行失敗，請查看上方錯誤。",
+		LangJapanese:           "今回の処理は失敗しました。上のエラーをご確認ください。",
+		LangSpanish:            "Este turno falló. Consulta el error de arriba.",
 	},
 	MsgFinalReplyComplete: {
 		LangEnglish:            "This reply is complete. See the result above.",

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -423,6 +424,14 @@ func (ts *TimerScheduler) executeJob(jobID string) {
 		}
 	} else {
 		err = <-done
+	}
+
+	if errors.Is(err, ErrQueuedForBusySession) {
+		// Delivered into the busy session's pending queue; the running turn
+		// drains it. Not a failure.
+		ts.store.MarkFired(jobID, nil)
+		slog.Info("timer: job queued", "id", jobID)
+		return
 	}
 
 	ts.store.MarkFired(jobID, err)

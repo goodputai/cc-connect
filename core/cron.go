@@ -714,6 +714,12 @@ func (cs *CronScheduler) runJob(job *CronJob, manual bool) {
 		err = <-done
 	}
 
+	if errors.Is(err, ErrQueuedForBusySession) {
+		cs.store.MarkRun(job.ID, nil)
+		slog.Info("cron: job queued", "id", job.ID, "manual", manual)
+		return
+	}
+
 	cs.store.MarkRun(job.ID, err)
 
 	if err != nil {
