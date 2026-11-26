@@ -143,3 +143,30 @@ func TestExecutorNotice_RouteRequiresMainUser(t *testing.T) {
 		t.Fatal("route_bot_senders_to_main without main_session_user accepted")
 	}
 }
+
+// Live Feishu im.message.receive_v1 events carry sender_type "bot" for bot
+// senders (11-26 henry topic_only: order from the orchestrating bot left no
+// requester, so no completion mention). Both "app" and "bot" must count.
+// Negative control: "user"-less unknown types still record nothing.
+func TestExecutorNotice_LiveBotSenderType(t *testing.T) {
+	for _, st := range []string{"app", "bot"} {
+		p := newExecutorTestPlatform()
+		p.mentionBotRequesterOnCompletion = true
+		rc := executorInbound(t, p, st, "ou_claude", "om_req_"+st, "do the job").ReplyCtx.(replyContext)
+		if rc.requesterID != "ou_claude" || !rc.requesterIsBot {
+			t.Fatalf("sender_type=%s: bot requester not recorded: %+v", st, rc)
+		}
+		p = newExecutorTestPlatform()
+		p.routeBotSendersToMain = map[string]bool{"ou_exec": true}
+		p.mainSessionUser = "ou_owner"
+		m := executorInbound(t, p, st, "ou_exec", "om_route_"+st, "本轮回复已完成，请查看上方结果。")
+		if m.SessionKey != "feishu:oc_group:ou_owner" {
+			t.Fatalf("sender_type=%s: notice not routed to main: %q", st, m.SessionKey)
+		}
+	}
+	p := newExecutorTestPlatform()
+	p.mentionBotRequesterOnCompletion = true
+	if rc := executorInbound(t, p, "anonymous", "ou_claude", "om_anon", "hi").ReplyCtx.(replyContext); rc.requesterID != "" {
+		t.Fatalf("anonymous sender recorded as requester: %+v", rc)
+	}
+}
