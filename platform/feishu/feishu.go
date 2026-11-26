@@ -1501,7 +1501,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// An executor bot's turn-end notice goes to the chat's main session, so the
 	// orchestrating agent there is woken (queued if busy) instead of a side
 	// session keyed by the executor. Other bot messages keep their own session.
-	if chatType == "group" && stringValue(sender.SenderType) == "app" && p.routeBotSendersToMain[userID] && isTurnEndNotice(content) {
+	if chatType == "group" && isBotSenderType(stringValue(sender.SenderType)) && p.routeBotSendersToMain[userID] && isTurnEndNotice(content) {
 		mainKey := p.mainSessionKey(chatID)
 		slog.Info(p.tag()+": routing executor notice to main session",
 			"message_id", messageID, "sender", userID, "from_session", sessionKey, "to_session", mainKey)
@@ -1511,10 +1511,10 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey, groupChat: chatType == "group", threadID: stringValue(msg.ThreadId), rootID: stringValue(msg.RootId)}
 	// Snapshot the actual human sender, not mentions in the prompt or mutable
 	// session state. Each queued turn must keep its own completion recipient.
-	switch stringValue(sender.SenderType) {
-	case "user":
+	switch st := stringValue(sender.SenderType); {
+	case st == "user":
 		rctx.requesterID = userID
-	case "app":
+	case isBotSenderType(st):
 		if p.mentionBotRequesterOnCompletion {
 			rctx.requesterID = userID
 			rctx.requesterIsBot = true
@@ -3734,6 +3734,11 @@ var turnEndMarkers = []string{
 	"本轮回复已完成", "本轮执行失败", "This reply is complete", "This turn failed",
 	"【执行方交付", "停手", "失败", "请你定",
 }
+
+// isBotSenderType reports whether an im.message.receive_v1 sender is a bot.
+// Live Feishu events carry "bot" (with is_agent); the message-list API and
+// older docs use "app". Accept both so bot-issued orders keep a requester.
+func isBotSenderType(t string) bool { return t == "app" || t == "bot" }
 
 func isTurnEndNotice(content string) bool {
 	for _, m := range turnEndMarkers {
