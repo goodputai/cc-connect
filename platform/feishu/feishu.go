@@ -116,6 +116,7 @@ type replyContext struct {
 	bootstrapThread bool
 	requesterID     string
 	requesterName   string
+	requesterIsBot  bool
 	groupChat       bool
 }
 
@@ -140,6 +141,16 @@ type Platform struct {
 	topicOnly                    bool
 	topicConcurrency             int
 	mentionRequesterOnCompletion bool
+	// mentionBotRequesterOnCompletion also records a bot sender as the turn's
+	// requester, so the completion/failed notice @-mentions the orchestrating
+	// bot (with a reply excerpt). Enable on executor instances only; enabling
+	// it on both sides of a bot pair would make them wake each other forever.
+	mentionBotRequesterOnCompletion bool
+	// routeBotSendersToMain lists bot open_ids (as seen by this app) whose
+	// turn-end notices are delivered to the chat's main session instead of a
+	// per-sender session. mainSessionUser names the main session's owner.
+	routeBotSendersToMain map[string]bool
+	mainSessionUser       string
 	// noReplyToTrigger: when true, send via Create instead of Im.Message.Reply (no quote to the user's message).
 	noReplyToTrigger bool
 	resolveMentions  bool
@@ -338,6 +349,27 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	}
 
 	mentionRequesterOnCompletion, _ := opts["mention_requester_on_completion"].(bool)
+	mentionBotRequesterOnCompletion, _ := opts["mention_bot_requester_on_completion"].(bool)
+	routeBotSendersToMain := map[string]bool{}
+	switch v := opts["route_bot_senders_to_main"].(type) {
+	case []any:
+		for _, item := range v {
+			if id, ok := item.(string); ok && strings.TrimSpace(id) != "" {
+				routeBotSendersToMain[strings.TrimSpace(id)] = true
+			}
+		}
+	case []string:
+		for _, id := range v {
+			if strings.TrimSpace(id) != "" {
+				routeBotSendersToMain[strings.TrimSpace(id)] = true
+			}
+		}
+	}
+	mainSessionUser, _ := opts["main_session_user"].(string)
+	mainSessionUser = strings.TrimSpace(mainSessionUser)
+	if len(routeBotSendersToMain) > 0 && mainSessionUser == "" {
+		return nil, fmt.Errorf("%s: route_bot_senders_to_main requires main_session_user", name)
+	}
 	resolveMentionsOpt, _ := opts["resolve_mentions"].(bool)
 	noReplyToTrigger := false
 	if v, ok := opts["reply_to_trigger"].(bool); ok && !v {
@@ -414,36 +446,39 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	}
 
 	base := &Platform{
-		platformName:                 name,
-		domain:                       domain,
-		appID:                        appID,
-		appSecret:                    appSecret,
-		progressStyle:                progressStyle,
-		useInteractiveCard:           useInteractiveCard,
-		reactionEmoji:                reactionEmoji,
-		doneEmoji:                    doneEmoji,
-		allowFrom:                    allowFrom,
-		allowChat:                    allowChat,
-		groupOnly:                    groupOnly,
-		groupReplyAll:                groupReplyAll,
-		respondToAtEveryoneAndHere:   respondToAtEveryoneAndHere,
-		shareSessionInChannel:        shareSessionInChannel,
-		threadIsolation:              threadIsolation,
-		topicOnly:                    topicMode == "topic_only",
-		topicConcurrency:             topicLimit,
-		mentionRequesterOnCompletion: mentionRequesterOnCompletion,
-		resolveMentions:              resolveMentionsOpt,
-		noReplyToTrigger:             noReplyToTrigger,
-		client:                       lark.NewClient(appID, appSecret, clientOpts...),
-		replayClient:                 newFeishuReplayClient(appID, appSecret, domain),
-		dedup:                        &core.MessageDedup{},
-		port:                         port,
-		callbackPath:                 callbackPath,
-		encryptKey:                   encryptKey,
-		peerBots:                     peerBots,
-		mentionMap:                   mentionMap,
-		imageBatch:                   make(map[string]*imageBatchEntry),
-		imageBatchWindow:             imageBatchWindow,
+		platformName:                    name,
+		domain:                          domain,
+		appID:                           appID,
+		appSecret:                       appSecret,
+		progressStyle:                   progressStyle,
+		useInteractiveCard:              useInteractiveCard,
+		reactionEmoji:                   reactionEmoji,
+		doneEmoji:                       doneEmoji,
+		allowFrom:                       allowFrom,
+		allowChat:                       allowChat,
+		groupOnly:                       groupOnly,
+		groupReplyAll:                   groupReplyAll,
+		respondToAtEveryoneAndHere:      respondToAtEveryoneAndHere,
+		shareSessionInChannel:           shareSessionInChannel,
+		threadIsolation:                 threadIsolation,
+		topicOnly:                       topicMode == "topic_only",
+		topicConcurrency:                topicLimit,
+		mentionRequesterOnCompletion:    mentionRequesterOnCompletion,
+		mentionBotRequesterOnCompletion: mentionBotRequesterOnCompletion,
+		routeBotSendersToMain:           routeBotSendersToMain,
+		mainSessionUser:                 mainSessionUser,
+		resolveMentions:                 resolveMentionsOpt,
+		noReplyToTrigger:                noReplyToTrigger,
+		client:                          lark.NewClient(appID, appSecret, clientOpts...),
+		replayClient:                    newFeishuReplayClient(appID, appSecret, domain),
+		dedup:                           &core.MessageDedup{},
+		port:                            port,
+		callbackPath:                    callbackPath,
+		encryptKey:                      encryptKey,
+		peerBots:                        peerBots,
+		mentionMap:                      mentionMap,
+		imageBatch:                      make(map[string]*imageBatchEntry),
+		imageBatchWindow:                imageBatchWindow,
 	}
 	if !useInteractiveCard {
 		base.self = base
@@ -1463,11 +1498,27 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	mentions := msg.Mentions
 	parentID := stringValue(msg.ParentId)
 
+	// An executor bot's turn-end notice goes to the chat's main session, so the
+	// orchestrating agent there is woken (queued if busy) instead of a side
+	// session keyed by the executor. Other bot messages keep their own session.
+	if chatType == "group" && stringValue(sender.SenderType) == "app" && p.routeBotSendersToMain[userID] && isTurnEndNotice(content) {
+		mainKey := p.mainSessionKey(chatID)
+		slog.Info(p.tag()+": routing executor notice to main session",
+			"message_id", messageID, "sender", userID, "from_session", sessionKey, "to_session", mainKey)
+		sessionKey = mainKey
+	}
+
 	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey, groupChat: chatType == "group", threadID: stringValue(msg.ThreadId), rootID: stringValue(msg.RootId)}
 	// Snapshot the actual human sender, not mentions in the prompt or mutable
 	// session state. Each queued turn must keep its own completion recipient.
-	if stringValue(sender.SenderType) == "user" {
+	switch stringValue(sender.SenderType) {
+	case "user":
 		rctx.requesterID = userID
+	case "app":
+		if p.mentionBotRequesterOnCompletion {
+			rctx.requesterID = userID
+			rctx.requesterIsBot = true
+		}
 	}
 	slog.Debug(p.tag()+": routed inbound message",
 		"message_id", messageID,
@@ -3665,6 +3716,32 @@ func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID strin
 		return fmt.Sprintf("%s:%s", p.tag(), chatID)
 	}
 	return fmt.Sprintf("%s:%s:%s", p.tag(), chatID, userID)
+}
+
+// mainSessionKey is the session the chat's owner talks to (not a thread or a
+// per-bot session); executor notices are routed here.
+func (p *Platform) mainSessionKey(chatID string) string {
+	if p.shareSessionInChannel {
+		return fmt.Sprintf("%s:%s", p.tag(), chatID)
+	}
+	return fmt.Sprintf("%s:%s:%s", p.tag(), chatID, p.mainSessionUser)
+}
+
+// turnEndMarkers identify an executor message that ends its turn: the
+// completion/failed notices cc-connect itself sends, the deliver.py marker,
+// and explicit stop / failure / ask-for-decision wording.
+var turnEndMarkers = []string{
+	"本轮回复已完成", "本轮执行失败", "This reply is complete", "This turn failed",
+	"【执行方交付", "停手", "失败", "请你定",
+}
+
+func isTurnEndNotice(content string) bool {
+	for _, m := range turnEndMarkers {
+		if strings.Contains(content, m) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Platform) sessionKeyFromCardAction(chatID, userID string, value map[string]any) string {

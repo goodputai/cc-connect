@@ -1663,15 +1663,15 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		return nil
 	}
 
-	session := sessions.GetOrCreateActive(sessionKey)
-	if !session.TryLock() {
-		return fmt.Errorf("session %q is busy", sessionKey)
-	}
-
 	iKey := sessionKey
 	if workspaceDir != "" {
 		iKey = workspaceDir + ":" + sessionKey
 	}
+	session := sessions.GetOrCreateActive(sessionKey)
+	if !session.TryLock() {
+		return e.queueScheduledForBusySession(effectivePlatform, msg, session, sessions, iKey, agent, workspaceDir)
+	}
+
 	prevHistLen := session.HistoryLen()
 	e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey)
 	// Same empty-response detection as the useNewSession path above.
@@ -1855,17 +1855,41 @@ func (e *Engine) ExecuteTimerJob(job *TimerJob) error {
 		return nil
 	}
 
-	session := sessions.GetOrCreateActive(sessionKey)
-	if !session.TryLock() {
-		return fmt.Errorf("session %q is busy", sessionKey)
-	}
-
 	iKey := sessionKey
 	if workspaceDir != "" {
 		iKey = workspaceDir + ":" + sessionKey
 	}
+	session := sessions.GetOrCreateActive(sessionKey)
+	if !session.TryLock() {
+		return e.queueScheduledForBusySession(effectivePlatform, msg, session, sessions, iKey, agent, workspaceDir)
+	}
+
 	e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey)
 	return nil
+}
+
+// ErrQueuedForBusySession reports that a scheduled prompt (timer, cron) found
+// its session busy and was appended to the session's pending queue instead of
+// being rejected. The running turn's drain loop delivers it after the current
+// turn ends, so the caller must treat it as delivered, not failed.
+var ErrQueuedForBusySession = errors.New("session busy; prompt queued for the running turn")
+
+// queueScheduledForBusySession reuses the platform-message queue
+// (queueMessageForBusySession + drainPendingMessages) for timer and cron
+// prompts. It returns ErrQueuedForBusySession on success and the old
+// "is busy" error only when the queue itself refuses (dead agent, queue full).
+func (e *Engine) queueScheduledForBusySession(p Platform, msg *Message, session *Session, sessions *SessionManager, iKey string, agent Agent, workspaceDir string) error {
+	if !e.queueMessageForBusySession(p, msg, iKey) {
+		return fmt.Errorf("session %q is busy", msg.SessionKey)
+	}
+	// Same race guard as the platform path: the drain loop may have finished
+	// between the failed TryLock and the append; if nobody holds the lock now,
+	// start a processor ourselves.
+	if session.TryLock() {
+		go e.drainOrphanedQueue(session, sessions, iKey, agent, workspaceDir)
+	}
+	slog.Info("scheduled prompt queued for busy session", "session_key", msg.SessionKey, "interactive_key", iKey)
+	return ErrQueuedForBusySession
 }
 
 func timerRunTitle(job *TimerJob) string {
@@ -4887,7 +4911,7 @@ func (e *Engine) runUnsolicitedReader(ctx context.Context, cancel context.Cancel
 					}
 				}
 				if event.Done && delivered && hasVisibleFinalReply(fullResponse) {
-					e.notifyFinalReply(p, replyCtx)
+					e.notifyFinalReply(p, replyCtx, fullResponse)
 				}
 
 				// Safety note: concurrent writes to session.History by the
@@ -6138,7 +6162,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 			if !isSilent {
-				e.notifyFinalReply(p, replyCtx)
+				e.notifyFinalReply(p, replyCtx, fullResponse)
 			}
 
 			if elapsed := time.Since(replyStart); elapsed >= slowPlatformSend {
@@ -6427,6 +6451,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				}
 				e.send(p, replyCtx, userMsg)
+				e.notifyTurnFailed(p, replyCtx, userMsg)
 			}
 			// Only drop queued messages if the agent session is dead.
 			// Some agents (e.g. Codex) emit EventError for per-turn failures
