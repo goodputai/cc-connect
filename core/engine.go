@@ -1881,7 +1881,13 @@ var ErrQueuedForBusySession = errors.New("session busy; prompt queued for the ru
 // prompts. It returns ErrQueuedForBusySession on success and the old
 // "is busy" error only when the queue itself refuses (dead agent, queue full).
 func (e *Engine) queueScheduledForBusySession(p Platform, msg *Message, session *Session, sessions *SessionManager, iKey string, agent Agent, workspaceDir string) error {
-	if !e.queueMessageForBusySession(p, msg, iKey) {
+	switch e.queueMessageForBusySessionResult(p, msg, iKey) {
+	case busyQueueQueued:
+	case busyQueueDropped:
+		// Queue full (or stale): the prompt is NOT in the queue, so the
+		// scheduler must see a failure instead of counting it as delivered.
+		return fmt.Errorf("session %q is busy and its queue refused the prompt", msg.SessionKey)
+	default:
 		return fmt.Errorf("session %q is busy", msg.SessionKey)
 	}
 	// Same race guard as the platform path: the drain loop may have finished
@@ -3275,11 +3281,27 @@ func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions 
 // the event loop sends it after the current turn's EventResult is received.
 // Returns true if the message was successfully queued, false otherwise.
 func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiveKey string) bool {
+	return e.queueMessageForBusySessionResult(p, msg, interactiveKey) != busyQueueRejected
+}
+
+// busyQueueResult distinguishes "appended to the queue" from "handled without
+// queueing" (queue full / stale message: a reply or log was emitted). Platform
+// messages treat both as handled; scheduled prompts must only report delivery
+// when the prompt is actually in the queue.
+type busyQueueResult int
+
+const (
+	busyQueueRejected busyQueueResult = iota
+	busyQueueQueued
+	busyQueueDropped
+)
+
+func (e *Engine) queueMessageForBusySessionResult(p Platform, msg *Message, interactiveKey string) busyQueueResult {
 	e.interactiveMu.Lock()
 	state, hasState := e.interactiveStates[interactiveKey]
 	if !hasState || state == nil {
 		e.interactiveMu.Unlock()
-		return false
+		return busyQueueRejected
 	}
 	// Keep interactiveMu until state.mu is held. Otherwise a starting session can
 	// replace a placeholder state between lookup and queue append, losing the
@@ -3291,7 +3313,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	// Allow queueing when agentSession is nil (session is starting up,
 	// issue #565). Only reject if the session was established and died.
 	if state.agentSession != nil && !state.agentSession.Alive() {
-		return false
+		return busyQueueRejected
 	}
 
 	// Only queue metadata — do NOT send to agent stdin yet.
@@ -3302,12 +3324,12 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	if e.isStaleUserMessageLocked(state, msg.UserMessageTimeMs) {
 		snap := userMessageWatermarkSnapshotLocked(state)
 		e.logStaleUserMessageDropped("reject_before_queue", msg, interactiveKey, snap)
-		return true
+		return busyQueueDropped
 	}
 	if len(state.pendingMessages) >= e.maxQueuedMessages {
 		depth := len(state.pendingMessages)
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgQueueFull), depth))
-		return true // handled: queue-full reply sent
+		return busyQueueDropped // handled: queue-full reply sent
 	}
 	state.pendingMessages = append(state.pendingMessages, queuedMessage{
 		topicGoalSet:        msg.topicGoalSet,
@@ -3350,7 +3372,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	} else {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
 	}
-	return true
+	return busyQueueQueued
 }
 
 // ensureInteractiveStateForQueueing creates a placeholder interactiveState

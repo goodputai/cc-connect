@@ -42,3 +42,31 @@ func TestScheduledPrompt_BusySessionQueuesAndDrains(t *testing.T) {
 	next.s.finish("TIMER-DONE")
 	tfWait(t, func() bool { return tfSaw(p.tfPlatform, "TIMER-DONE") })
 }
+
+// A timer that fires while the busy session queue is full must surface a
+// failure, not ErrQueuedForBusySession (which the scheduler counts as
+// delivered). Negative control: before busyQueueResult the queue-full branch
+// returned true and the timer was silently reported as queued and lost.
+func TestScheduledPrompt_QueueFullIsNotDelivered(t *testing.T) {
+	p := &tqPlatform{&tfPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}, limit: 4}}
+	a := &tfAgent{started: make(chan tfStart, 32)}
+	e := NewEngine("test", a, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	e.dataDir = t.TempDir()
+	e.maxQueuedMessages = 1
+	t.Cleanup(func() { _ = e.Stop() })
+
+	const key = "test:chat:commander"
+	e.ReceiveMessage(p, &Message{Platform: "test", SessionKey: key, MessageID: "MAIN", Content: "MAIN", UserID: "commander", ReplyCtx: tfContext{"chat", "", "root"}})
+	main := tfNext(t, a, "MAIN")
+
+	if err := e.ExecuteTimerJob(&TimerJob{ID: "t1", SessionKey: key, Prompt: "FIRST"}); !errors.Is(err, ErrQueuedForBusySession) {
+		t.Fatalf("first timer: err=%v, want ErrQueuedForBusySession", err)
+	}
+	err := e.ExecuteTimerJob(&TimerJob{ID: "t2", SessionKey: key, Prompt: "SECOND"})
+	if err == nil || errors.Is(err, ErrQueuedForBusySession) {
+		t.Fatalf("timer on full queue: err=%v, want a non-queued failure", err)
+	}
+	main.s.finish("MAIN-DONE")
+	tfNext(t, a, "FIRST").s.finish("FIRST-DONE")
+	tfWait(t, func() bool { return tfSaw(p.tfPlatform, "FIRST-DONE") })
+}
