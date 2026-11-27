@@ -215,6 +215,7 @@ var topLevelCommandHandlers = map[string]func([]string){
 	},
 	"provider":  runProviderCommand,
 	"send":      runSend,
+	"queue":     runQueue,
 	"inject":    runInject,
 	"cron":      runCron,
 	"timer":     runTimer,
@@ -1671,6 +1672,7 @@ Commands:
     logs             View daemon logs (-f to follow, -n N for last N lines)
 
   send               Send a message to an active session via internal API
+  queue              Add, move, list and inspect queue items
                      (-m <text> | --stdin, -p <project>, -s <session>)
 
   cron               Manage scheduled tasks

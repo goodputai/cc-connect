@@ -152,7 +152,7 @@ func (e *qcEnv) completions() []*queueItem {
 	defer e.c.mu.Unlock()
 	var out []*queueItem
 	for _, it := range e.c.items {
-		if it.Kind == queueKindCompletion {
+		if it.Kind == queueKindCompletion && (it.Status == queueStatusQueued || it.Status == queueStatusRunning) {
 			out = append(out, it.clone())
 		}
 	}
@@ -162,7 +162,7 @@ func (e *qcEnv) completions() []*queueItem {
 func TestQueueCenterEnqueueIdempotentAndRejects(t *testing.T) {
 	e := newQCEnv(t, t.TempDir())
 	first, status := e.enqueue("A1")
-	if status != http.StatusCreated || !strings.HasPrefix(first.ID, "q_") || first.Status != "queued" || first.Position != 1 {
+	if status != http.StatusCreated || !strings.HasPrefix(first.ID, "q_") || first.Status != queueStatusQueued || first.Position != 1 {
 		t.Fatalf("first enqueue = %+v, HTTP %d", first, status)
 	}
 	again, status := e.enqueue("A1", func(r *queueEnqueueRequest) { r.Prompt = "different" })
@@ -252,7 +252,7 @@ func TestQueueCenterDispatchLifecycle(t *testing.T) {
 	if got := e.sentIDs(); len(got) != 1 || got[0] != a {
 		t.Fatalf("first pass sent %v, want only %s", got, a)
 	}
-	if e.status(a) != "running" || e.c.lookup(a).StartedAt == nil || e.status(b) != "queued" {
+	if e.status(a) != queueStatusRunning || e.c.lookup(a).StartedAt == nil || e.status(b) != queueStatusQueued {
 		t.Fatalf("after first pass: a=%s b=%s", e.status(a), e.status(b))
 	}
 	high := e.mustEnqueue("L3", func(r *queueEnqueueRequest) { r.Priority = "high" })
@@ -262,14 +262,8 @@ func TestQueueCenterDispatchLifecycle(t *testing.T) {
 	}
 
 	e.finish(a, "done", "all good")
-	if got := e.c.lookup(a); got.Status != "done" || got.Tail != "all good" || got.FinishedAt == nil {
+	if got := e.c.lookup(a); got.Status != queueStatusDone || got.Tail != "all good" || got.FinishedAt == nil {
 		t.Fatalf("archived item = %+v", got)
-	}
-	e.c.mu.Lock()
-	_, stillActive := e.c.items[a]
-	e.c.mu.Unlock()
-	if stillActive {
-		t.Fatal("finished item still in active state")
 	}
 	e.c.step(context.Background())
 	if got := e.sentIDs(); len(got) != 2 || got[1] != high {
@@ -278,7 +272,7 @@ func TestQueueCenterDispatchLifecycle(t *testing.T) {
 	if code, _ := e.c.report(a, "finished", queueTurnReport{Status: "done"}); code != http.StatusOK {
 		t.Fatalf("repeated finished for archived item: HTTP %d, want 200", code)
 	}
-	if res, status := e.enqueue("L1"); status != http.StatusOK || res.ID != a || res.Status != "done" {
+	if res, status := e.enqueue("L1"); status != http.StatusOK || res.ID != a || res.Status != queueStatusDone {
 		t.Fatalf("duplicate of finished item = %+v HTTP %d", res, status)
 	}
 	items, err := e.c.list(map[string][]string{"status": {"done"}})
@@ -299,11 +293,11 @@ func TestQueueCenterRequeuesBusySession(t *testing.T) {
 	}
 	id := e.mustEnqueue("B1")
 	e.c.step(context.Background())
-	if got := e.status(id); got != "queued" {
+	if got := e.status(id); got != queueStatusQueued {
 		t.Fatalf("after 409 status = %s, want queued", got)
 	}
 	e.c.step(context.Background())
-	if got := e.status(id); got != "running" || calls != 2 {
+	if got := e.status(id); got != queueStatusRunning || calls != 2 {
 		t.Fatalf("after retry status = %s calls = %d", got, calls)
 	}
 
@@ -312,12 +306,12 @@ func TestQueueCenterRequeuesBusySession(t *testing.T) {
 	e2.busy(qcProject, qcKey, "")
 	id2 := e2.mustEnqueue("B2")
 	e2.c.step(context.Background())
-	if len(e2.sentIDs()) != 0 || e2.status(id2) != "queued" {
+	if len(e2.sentIDs()) != 0 || e2.status(id2) != queueStatusQueued {
 		t.Fatalf("busy session got a push: %v", e2.sentIDs())
 	}
 	e2.idle(qcProject, qcKey)
 	e2.c.step(context.Background())
-	if e2.status(id2) != "running" {
+	if e2.status(id2) != queueStatusRunning {
 		t.Fatalf("idle session not dispatched: %s", e2.status(id2))
 	}
 }
@@ -338,7 +332,7 @@ func TestQueueCenterRestartRecovery(t *testing.T) {
 	queued := e.mustEnqueue("D4")
 	pending := e.mustEnqueue("D5", func(r *queueEnqueueRequest) { r.SessionKey = otherKey })
 	e.halted[otherKey] = true
-	if e.status(alive) != "running" || e.status(lost) != "running" || e.status(queued) != "queued" {
+	if e.status(alive) != queueStatusRunning || e.status(lost) != queueStatusRunning || e.status(queued) != queueStatusQueued {
 		t.Fatalf("before crash: %s %s %s", e.status(alive), e.status(lost), e.status(queued))
 	}
 
@@ -351,30 +345,30 @@ func TestQueueCenterRestartRecovery(t *testing.T) {
 	r.idle(qcProject, lostKey)
 	r.busy(qcProject, qcKey, alive)
 	r.c.step(context.Background())
-	if got := r.c.lookup(done); got == nil || got.Status != "done" || got.Tail != "finished before crash" {
+	if got := r.c.lookup(done); got == nil || got.Status != queueStatusDone || got.Tail != "finished before crash" {
 		t.Fatalf("finished item after restart = %+v", got)
 	}
-	if got := r.status(alive); got != "running" {
+	if got := r.status(alive); got != queueStatusRunning {
 		t.Fatalf("live turn after restart = %s, want running (no false lost-finish)", got)
 	}
-	if got := r.c.lookup(lost); got.Status != "failed" || got.Reason != "lost-finish" {
-		t.Fatalf("dead turn after restart = %s/%s, want failed/lost-finish", got.Status, got.Reason)
+	if got := r.c.lookup(lost); got.Status != queueStatusQueued || got.LastError != "lost-finish" || got.Executor != nil {
+		t.Fatalf("dead turn after restart = %s/%s, want pending/lost-finish", got.Status, got.LastError)
 	}
-	if got := r.status(queued); got != "queued" {
+	if got := r.status(queued); got != queueStatusQueued {
 		t.Fatalf("queued behind live turn = %s", got)
 	}
 	r.finish(alive, "done", "")
 	r.c.step(context.Background())
-	if got := r.status(queued); got != "running" {
+	if got := r.status(queued); got != queueStatusRunning {
 		t.Fatalf("queued item not pushed after restart: %s", got)
 	}
 	r.c.step(context.Background())
-	if got := r.status(pending); got != "running" {
+	if got := r.status(pending); got != queueStatusRunning {
 		t.Fatalf("item queued before crash not pushed: %s", got)
 	}
-	info, err := os.Stat(filepath.Join(dir, "state.json"))
+	info, err := os.Stat(r.c.itemPath(done))
 	if err != nil || info.Mode().Perm() != 0600 {
-		t.Fatalf("state file mode = %v, %v", info, err)
+		t.Fatalf("item file mode = %v, %v", info, err)
 	}
 }
 
@@ -388,8 +382,8 @@ func TestQueueCenterCompletionWake(t *testing.T) {
 		t.Fatalf("completion items = %d, want 1", len(cbs))
 	}
 	cb := cbs[0]
-	if cb.IdempotencyKey != "cb:"+id || cb.SessionKey != qcSrcKey || !strings.Contains(cb.Prompt, "tail text") ||
-		!strings.Contains(cb.Prompt, id) || !strings.Contains(cb.Prompt, "done") {
+	if !strings.HasPrefix(cb.IdempotencyKey, "cb:"+id+":") || cb.SessionKey != qcSrcKey || !strings.Contains(cb.Prompt, "tail text") ||
+		!strings.Contains(cb.Prompt, id) || !strings.Contains(cb.Prompt, queueResultDelivered) {
 		t.Fatalf("completion item = %+v", cb)
 	}
 	e.c.step(context.Background())
@@ -444,28 +438,29 @@ func TestQueueCenterTimeouts(t *testing.T) {
 	e.c.step(context.Background())
 	e.advance(59 * time.Minute)
 	e.c.step(context.Background())
-	if e.status(id) != "running" {
+	if e.status(id) != queueStatusRunning {
 		t.Fatalf("timed out early: %s", e.status(id))
 	}
 	e.advance(time.Minute)
 	e.c.step(context.Background())
-	if e.status(id) != "timed_out" {
-		t.Fatalf("after 1h status = %s, want timed_out", e.status(id))
+	if got := e.c.lookup(id); got.Status != queueStatusQueued || !strings.Contains(got.LastError, "timed_out") || got.Executor != nil {
+		t.Fatalf("after 1h item = %+v", got)
 	}
 	cbs := e.completions()
-	if len(cbs) != 1 || cbs[0].IdempotencyKey != "cb:"+id+":timed_out" || !strings.Contains(cbs[0].Prompt, "timed_out") {
+	if len(cbs) != 1 || !strings.HasPrefix(cbs[0].IdempotencyKey, "cb:"+id+":") || !strings.Contains(cbs[0].Prompt, "timed_out") {
 		t.Fatalf("timeout wake = %+v", cbs)
 	}
-	if e.status(next) != "queued" {
+	if e.status(next) != queueStatusQueued {
 		t.Fatalf("lane freed while the timed-out turn may still run: %s", e.status(next))
 	}
-	// The turn was not stopped; its late finish still lands and wakes again.
+	// The turn was not stopped. Its late finish cannot rewrite the failed
+	// attempt or wake the issuer a second time.
 	e.finish(id, "done", "late")
-	if got := e.c.lookup(id); got.Status != "done" || got.Tail != "late" {
+	if got := e.c.lookup(id); got.Status != queueStatusQueued || got.Tail == "late" {
 		t.Fatalf("late finish = %+v", got)
 	}
-	if got := len(e.completions()); got != 2 {
-		t.Fatalf("completions after late finish = %d, want 2", got)
+	if got := len(e.completions()); got != 1 {
+		t.Fatalf("completions after late finish = %d, want 1", got)
 	}
 
 	// Dispatched but never started: dispatch_failed after 5 minutes.
@@ -475,13 +470,13 @@ func TestQueueCenterTimeouts(t *testing.T) {
 	d.c.step(context.Background())
 	d.advance(4 * time.Minute)
 	d.c.step(context.Background())
-	if d.status(stuck) != "running" || len(d.sentIDs()) != 2 {
+	if d.status(stuck) != queueStatusRunning || len(d.sentIDs()) != 2 {
 		t.Fatalf("before 5 min: %s, %d pushes", d.status(stuck), len(d.sentIDs()))
 	}
 	d.advance(time.Minute)
 	d.c.step(context.Background())
-	if got := d.c.lookup(stuck); got.Status != "failed" || got.Reason != "dispatch_failed" {
-		t.Fatalf("after 5 min = %s/%s, want failed/dispatch_failed", got.Status, got.Reason)
+	if got := d.c.lookup(stuck); got.Status != queueStatusQueued || got.LastError != "dispatch_failed" || got.Executor != nil {
+		t.Fatalf("after 5 min = %s/%s, want pending/dispatch_failed", got.Status, got.LastError)
 	}
 	if cbs := d.completions(); len(cbs) != 1 || !strings.Contains(cbs[0].Prompt, "dispatch_failed") {
 		t.Fatalf("dispatch_failed wake = %+v", cbs)
@@ -493,7 +488,7 @@ func TestQueueCenterCancelAndPatch(t *testing.T) {
 	running := e.mustEnqueue("C1")
 	e.c.step(context.Background())
 	queued := e.mustEnqueue("C2")
-	if _, code, _ := e.c.cancel(running); code != http.StatusConflict {
+	if _, code, _ := e.c.cancel(running, "operator cancelled"); code != http.StatusConflict {
 		t.Fatalf("cancel running: HTTP %d, want 409", code)
 	}
 	prompt, high := "new prompt", "high"
@@ -501,14 +496,14 @@ func TestQueueCenterCancelAndPatch(t *testing.T) {
 		t.Fatalf("patch running: HTTP %d, want 409", code)
 	}
 	it, code, _ := e.c.patch(queued, queuePatchRequest{Prompt: &prompt, Priority: &high})
-	if code != http.StatusOK || it.Prompt != prompt || it.Priority != "high" ||
+	if code != http.StatusOK || it.Prompt != prompt || it.Priority != "P0" ||
 		!strings.Contains(it.History[len(it.History)-1].Note, "prompt") {
 		t.Fatalf("patch queued = %+v HTTP %d", it, code)
 	}
-	if _, code, _ := e.c.cancel(queued); code != http.StatusOK || e.status(queued) != "cancelled" {
+	if _, code, _ := e.c.cancel(queued, "operator cancelled"); code != http.StatusOK || e.status(queued) != queueStatusCancelled {
 		t.Fatalf("cancel queued: HTTP %d status %s", code, e.status(queued))
 	}
-	if _, code, _ := e.c.cancel(queued); code != http.StatusConflict {
+	if _, code, _ := e.c.cancel(queued, "operator cancelled"); code != http.StatusConflict {
 		t.Fatalf("cancel again: HTTP %d, want 409", code)
 	}
 }
@@ -552,7 +547,7 @@ func TestQueueCenterExecutorHTTP(t *testing.T) {
 	if err := back.reportTurn(context.Background(), id, "finished", queueTurnReport{Status: "done", Tail: "remote tail"}); err != nil {
 		t.Fatal(err)
 	}
-	if it := e.c.lookup(id); it.Status != "done" || it.Tail != "remote tail" {
+	if it := e.c.lookup(id); it.Status != queueStatusDone || it.Tail != "remote tail" {
 		t.Fatalf("after remote finish = %+v", it)
 	}
 	var gone queueReportGone
@@ -567,12 +562,8 @@ func TestQueueCenterWakeOncePerEvent(t *testing.T) {
 	e := newQCEnv(t, t.TempDir())
 	id := e.mustEnqueue("O1", withWake)
 	e.c.step(context.Background())
-	e.c.mu.Lock()
-	it := e.c.items[id].clone()
-	it.Status = queueStatusDone
-	e.c.wakeLocked(it, "")
-	e.c.wakeLocked(it, "")
-	e.c.mu.Unlock()
+	e.finish(id, queueReportDone, "ack")
+	e.finish(id, queueReportDone, "duplicate")
 	if got := len(e.completions()); got != 1 {
 		t.Fatalf("completions for one event = %d, want 1", got)
 	}

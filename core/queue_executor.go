@@ -18,6 +18,7 @@ import (
 
 type queueTurnRequest struct {
 	ItemID     string `json:"item_id"`
+	Attempt    string `json:"attempt,omitempty"`
 	Project    string `json:"project"`
 	SessionKey string `json:"session_key"`
 	NewSession bool   `json:"new_session"`
@@ -27,6 +28,8 @@ type queueTurnRequest struct {
 
 type queueTurnReport struct {
 	TurnID         string    `json:"turn_id"`
+	Attempt        string    `json:"attempt,omitempty"`
+	FirstLine      string    `json:"first_line,omitempty"`
 	StartedAt      time.Time `json:"started_at"`
 	Status         string    `json:"status,omitempty"`
 	Reason         string    `json:"reason,omitempty"`
@@ -52,7 +55,12 @@ func (o *queueTurnObservation) finish(status, reason, content string) {
 		o.mu.Lock()
 		id := o.replyID
 		o.mu.Unlock()
-		o.ended <- queueTurnReport{Status: status, Reason: reason, Tail: finalReplyTail(content), ReplyMessageID: id}
+		firstLine, _, _ := strings.Cut(content, "\n")
+		if !strings.HasPrefix(firstLine, "【阻塞】") {
+			firstLine = ""
+		}
+		o.ended <- queueTurnReport{Status: status, Reason: reason, Tail: finalReplyTail(content),
+			FirstLine: strings.TrimSuffix(firstLine, "\r"), ReplyMessageID: id}
 	})
 }
 
@@ -164,7 +172,7 @@ func (x *queueExecutor) accept(req queueTurnRequest) (queueTurnReport, int, erro
 	if !active.TryLock() {
 		return queueTurnReport{}, http.StatusConflict, errors.New("session is busy")
 	}
-	start := queueTurnReport{TurnID: "t_" + rand.Text(), StartedAt: time.Now()}
+	start := queueTurnReport{TurnID: "t_" + rand.Text(), Attempt: req.Attempt, StartedAt: time.Now()}
 	entry := &queueExecution{request: req, start: start, observation: &queueTurnObservation{ended: make(chan queueTurnReport, 1)}}
 	x.items[req.ItemID] = entry
 	go x.run(engine, agent, manager, active, platform, replyCtx, entry)
@@ -226,7 +234,7 @@ func (x *queueExecutor) reportTurn(entry *queueExecution) {
 	select {
 	case <-x.ctx.Done():
 	case result := <-entry.observation.ended:
-		result.TurnID, result.StartedAt = entry.start.TurnID, entry.start.StartedAt
+		result.TurnID, result.Attempt, result.StartedAt = entry.start.TurnID, entry.start.Attempt, entry.start.StartedAt
 		x.reportUntilAcknowledged(itemID, "finished", result)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -53,10 +54,11 @@ type queueSession struct {
 }
 
 type queueFleetNode struct {
-	Instance  string         `json:"instance"`
-	Reachable bool           `json:"reachable"`
-	FetchedAt *time.Time     `json:"fetched_at"`
-	Sessions  []queueSession `json:"sessions"`
+	Instance         string         `json:"instance"`
+	Reachable        bool           `json:"reachable"`
+	FetchedAt        *time.Time     `json:"fetched_at"`
+	Sessions         []queueSession `json:"sessions"`
+	unreachableSince *time.Time
 }
 
 type queueRemote struct {
@@ -186,10 +188,11 @@ func (f *queueFleet) poll(ctx context.Context) {
 			sent := time.Now()
 			sessions, err := peer.fetchSessions(ctx)
 			if err != nil {
-				next[i] = queueFleetNode{Instance: peer.name, Sessions: []queueSession{}}
+				failedAt := time.Now()
+				next[i] = queueFleetNode{Instance: peer.name, Sessions: []queueSession{}, unreachableSince: &failedAt}
 				return
 			}
-			next[i] = queueFleetNode{peer.name, true, &sent, sessions}
+			next[i] = queueFleetNode{Instance: peer.name, Reachable: true, FetchedAt: &sent, Sessions: sessions}
 		})
 	}
 	wg.Wait()
@@ -197,7 +200,11 @@ func (f *queueFleet) poll(ctx context.Context) {
 	defer f.mu.Unlock()
 	for _, node := range next {
 		if !node.Reachable {
-			node.FetchedAt = f.nodes[node.Instance].FetchedAt
+			previous := f.nodes[node.Instance]
+			node.FetchedAt = previous.FetchedAt
+			if previous.unreachableSince != nil {
+				node.unreachableSince = previous.unreachableSince
+			}
 		}
 		f.nodes[node.Instance] = node
 	}
@@ -263,7 +270,7 @@ func (s *APIServer) StartQueueCenter(cfg QueueCenterConfig, dataDir string) erro
 		now := time.Now()
 		views := map[string]queueView{cfg.Instance: {Known: true, Reachable: true, FetchedAt: &now, Sessions: s.queueSessions(cfg.Instance)}}
 		for _, node := range fleet.snapshot() {
-			views[node.Instance] = queueView{Known: true, Reachable: node.Reachable, FetchedAt: node.FetchedAt, Sessions: node.Sessions}
+			views[node.Instance] = queueView{Known: true, Reachable: node.Reachable, FetchedAt: node.FetchedAt, Sessions: node.Sessions, UnreachableSince: node.unreachableSince}
 		}
 		return views
 	}
@@ -281,7 +288,7 @@ func (s *APIServer) StartQueueCenter(cfg QueueCenterConfig, dataDir string) erro
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/fleet", func(w http.ResponseWriter, r *http.Request) {
 		now := time.Now()
-		local := queueFleetNode{cfg.Instance, true, &now, s.queueSessions(cfg.Instance)}
+		local := queueFleetNode{Instance: cfg.Instance, Reachable: true, FetchedAt: &now, Sessions: s.queueSessions(cfg.Instance)}
 		nodes := append([]queueFleetNode{local}, fleet.snapshot()...)
 		center.applyDepth(nodes)
 		apiJSON(w, http.StatusOK, nodes)
@@ -429,4 +436,99 @@ func (sm *SessionManager) appendQueueSessions(rows map[string]queueSession) {
 			rows[key] = row
 		}
 	}
+}
+
+func (p *queueRemote) startTurn(ctx context.Context, req queueTurnRequest) (queueTurnReport, int, error) {
+	res, err := p.postJSON(ctx, "/x/turns", req)
+	if err != nil {
+		return queueTurnReport{}, 0, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusAccepted {
+		msg, _ := io.ReadAll(io.LimitReader(res.Body, 512))
+		return queueTurnReport{}, res.StatusCode, fmt.Errorf("executor returned HTTP %d: %s", res.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	var report queueTurnReport
+	if err := json.NewDecoder(res.Body).Decode(&report); err != nil {
+		return queueTurnReport{}, 0, fmt.Errorf("decode executor turn: %w", err)
+	}
+	return report, res.StatusCode, nil
+}
+
+func (c *queueCenter) register(mux *http.ServeMux) {
+	fail := func(w http.ResponseWriter, status int, err error) { http.Error(w, err.Error(), status) }
+	mux.HandleFunc("POST /v1/queue/items", func(w http.ResponseWriter, r *http.Request) {
+		var req queueEnqueueRequest
+		if !decodeQueueJSON(w, r, &req) {
+			return
+		}
+		res, status, err := c.enqueue(req)
+		if err != nil {
+			fail(w, status, err)
+			return
+		}
+		apiJSON(w, status, res)
+	})
+	mux.HandleFunc("GET /v1/queue/items", func(w http.ResponseWriter, r *http.Request) {
+		items, err := c.list(r.URL.Query())
+		if err != nil {
+			fail(w, http.StatusBadRequest, err)
+			return
+		}
+		apiJSON(w, http.StatusOK, items)
+	})
+	mux.HandleFunc("GET /v1/queue/bottleneck", func(w http.ResponseWriter, r *http.Request) {
+		items, err := c.bottleneck(r.URL.Query())
+		if err != nil {
+			fail(w, http.StatusBadRequest, err)
+			return
+		}
+		apiJSON(w, http.StatusOK, items)
+	})
+	mux.HandleFunc("GET /v1/queue/items/{id}", func(w http.ResponseWriter, r *http.Request) {
+		it := c.lookup(r.PathValue("id"))
+		if it == nil {
+			fail(w, http.StatusNotFound, errors.New("item not found"))
+			return
+		}
+		apiJSON(w, http.StatusOK, it)
+	})
+	mux.HandleFunc("POST /v1/queue/items/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Reason string `json:"reason"`
+		}
+		if r.ContentLength != 0 && !decodeQueueJSON(w, r, &req) {
+			return
+		}
+		it, status, err := c.cancel(r.PathValue("id"), req.Reason)
+		if err != nil {
+			fail(w, status, err)
+			return
+		}
+		apiJSON(w, status, it)
+	})
+	mux.HandleFunc("PATCH /v1/queue/items/{id}", func(w http.ResponseWriter, r *http.Request) {
+		var req queuePatchRequest
+		if !decodeQueueJSON(w, r, &req) {
+			return
+		}
+		it, status, err := c.patch(r.PathValue("id"), req)
+		if err != nil {
+			fail(w, status, err)
+			return
+		}
+		apiJSON(w, status, it)
+	})
+	mux.HandleFunc("POST /v1/turns/{id}/{event}", func(w http.ResponseWriter, r *http.Request) {
+		var body queueTurnReport
+		if !decodeQueueJSON(w, r, &body) {
+			return
+		}
+		status, err := c.report(r.PathValue("id"), r.PathValue("event"), body)
+		if err != nil {
+			fail(w, status, err)
+			return
+		}
+		apiJSON(w, status, map[string]bool{"ok": true})
+	})
 }
