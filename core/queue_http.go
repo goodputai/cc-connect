@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -180,13 +181,15 @@ func (f *queueFleet) poll(ctx context.Context) {
 	var wg sync.WaitGroup
 	for i, peer := range f.peers {
 		wg.Go(func() {
+			// fetched_at is when the request was sent, so a snapshot is never
+			// newer than the executor state it describes.
+			sent := time.Now()
 			sessions, err := peer.fetchSessions(ctx)
 			if err != nil {
 				next[i] = queueFleetNode{Instance: peer.name, Sessions: []queueSession{}}
 				return
 			}
-			now := time.Now()
-			next[i] = queueFleetNode{peer.name, true, &now, sessions}
+			next[i] = queueFleetNode{peer.name, true, &sent, sessions}
 		})
 	}
 	wg.Wait()
@@ -248,18 +251,83 @@ func (s *APIServer) StartQueueCenter(cfg QueueCenterConfig, dataDir string) erro
 		seen[peer.Name] = true
 		fleet.peers = append(fleet.peers, remote)
 	}
+	center, err := newQueueCenter(filepath.Join(dataDir, "queue"))
+	if err != nil {
+		return err
+	}
+	remotes := make(map[string]*queueRemote, len(fleet.peers))
+	for _, peer := range fleet.peers {
+		remotes[peer.name] = peer
+	}
+	center.views = func() map[string]queueView {
+		now := time.Now()
+		views := map[string]queueView{cfg.Instance: {Known: true, Reachable: true, FetchedAt: &now, Sessions: s.queueSessions(cfg.Instance)}}
+		for _, node := range fleet.snapshot() {
+			views[node.Instance] = queueView{Known: true, Reachable: node.Reachable, FetchedAt: node.FetchedAt, Sessions: node.Sessions}
+		}
+		return views
+	}
+	center.startTurn = func(ctx context.Context, instance string, req queueTurnRequest) (queueTurnReport, int, error) {
+		if instance == cfg.Instance {
+			return s.queueTurns.accept(req)
+		}
+		remote := remotes[instance]
+		if remote == nil {
+			return queueTurnReport{}, http.StatusNotFound, errors.New("instance not found")
+		}
+		return remote.startTurn(ctx, req)
+	}
+	center.notify = s.queueNotify
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/fleet", func(w http.ResponseWriter, r *http.Request) {
 		now := time.Now()
 		local := queueFleetNode{cfg.Instance, true, &now, s.queueSessions(cfg.Instance)}
-		apiJSON(w, http.StatusOK, append([]queueFleetNode{local}, fleet.snapshot()...))
+		nodes := append([]queueFleetNode{local}, fleet.snapshot()...)
+		center.applyDepth(nodes)
+		apiJSON(w, http.StatusOK, nodes)
 	})
-	ctx, err := s.startQueueHTTP(cfg.Address, token, mux, nil)
+	center.register(mux)
+	ctx, err := s.startQueueHTTP(cfg.Address, token, mux, func(ctx context.Context) {
+		// Local sessions use the same executor path as remote ones; their
+		// reports go straight to the center.
+		s.queueTurns = newQueueExecutor(s, ctx, func(_ context.Context, itemID, event string, body queueTurnReport) error {
+			status, err := center.report(itemID, event, body)
+			if err != nil && status < http.StatusInternalServerError {
+				return queueReportGone{status}
+			}
+			return err
+		})
+	})
 	if err != nil {
 		return err
 	}
 	go fleet.run(ctx)
+	go center.run(ctx)
 	return nil
+}
+
+// queueNotify posts a plain notice into a local session's chat.
+func (s *APIServer) queueNotify(sessionKey, text string) {
+	s.mu.RLock()
+	engines := make([]*Engine, 0, len(s.engines))
+	for _, engine := range s.engines {
+		engines = append(engines, engine)
+	}
+	s.mu.RUnlock()
+	for _, engine := range engines {
+		if engine.sessions.LookupActive(sessionKey) == nil {
+			continue
+		}
+		_, platform, replyCtx, err := engine.resolveOutboundSessionTarget(sessionKey, false)
+		if err == nil {
+			err = platform.Send(engine.ctx, replyCtx, text)
+		}
+		if err != nil {
+			slog.Warn("queue notice not delivered", "session_key", sessionKey, "error", err)
+		}
+		return
+	}
+	slog.Warn("queue notice has no local session", "session_key", sessionKey)
 }
 
 func (s *APIServer) StartQueueExecutor(cfg QueueExecutorConfig) error {

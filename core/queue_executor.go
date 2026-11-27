@@ -68,10 +68,6 @@ type queueExecution struct {
 	observation *queueTurnObservation
 }
 
-type queueDestination struct {
-	Instance, Project, SessionKey string
-}
-
 type queueTurnReporter func(context.Context, string, string, queueTurnReport) error
 
 type queueExecutor struct {
@@ -238,9 +234,15 @@ func (x *queueExecutor) reportTurn(entry *queueExecution) {
 func (x *queueExecutor) reportUntilAcknowledged(itemID, event string, body queueTurnReport) bool {
 	delay := 250 * time.Millisecond
 	for x.ctx.Err() == nil {
-		if err := x.report(x.ctx, itemID, event, body); err == nil {
+		err := x.report(x.ctx, itemID, event, body)
+		if err == nil {
 			return true
-		} else if delay == 250*time.Millisecond {
+		}
+		if gone := (queueReportGone{}); errors.As(err, &gone) {
+			slog.Warn("queue report refused", "item_id", itemID, "event", event, "error", err)
+			return false
+		}
+		if delay == 250*time.Millisecond {
 			slog.Warn("queue report pending retry", "item_id", itemID, "event", event, "error", err)
 		}
 		timer := time.NewTimer(delay)
@@ -301,8 +303,12 @@ func (p *queueRemote) reportTurn(ctx context.Context, itemID, event string, repo
 		return err
 	}
 	defer res.Body.Close()
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return fmt.Errorf("center rejected report with HTTP %d", res.StatusCode)
+	switch {
+	case res.StatusCode >= 200 && res.StatusCode < 300:
+		return nil
+	case res.StatusCode >= 400 && res.StatusCode < 500 && res.StatusCode != http.StatusRequestTimeout &&
+		res.StatusCode != http.StatusTooManyRequests && res.StatusCode != http.StatusUnauthorized:
+		return queueReportGone{res.StatusCode}
 	}
-	return nil
+	return fmt.Errorf("center rejected report with HTTP %d", res.StatusCode)
 }
