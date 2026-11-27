@@ -107,6 +107,8 @@ type Config struct {
 	Relay              RelayConfig             `toml:"relay"`               // bot-to-bot relay behavior
 	Cron               CronConfig              `toml:"cron"`
 	Queue              QueueConfig             `toml:"queue"`
+	QueueCenter        QueueCenterConfig       `toml:"queue_center"`
+	QueueExecutor      QueueExecutorConfig     `toml:"queue_executor"`
 	Webhook            WebhookConfig           `toml:"webhook"`
 	Bridge             BridgeConfig            `toml:"bridge"`
 	Management         ManagementConfig        `toml:"management"`
@@ -145,6 +147,29 @@ type CronConfig struct {
 // QueueConfig controls the per-session message queue.
 type QueueConfig struct {
 	MaxDepth *int `toml:"max_depth"` // max queued messages per session; default 5
+}
+
+// QueueCenterConfig enables the authenticated center API when Address is set.
+type QueueCenterConfig struct {
+	Address   string            `toml:"address,omitempty"`
+	Instance  string            `toml:"instance,omitempty"`
+	TokenFile string            `toml:"token_file,omitempty"`
+	Peers     []QueuePeerConfig `toml:"peers,omitempty"`
+}
+
+type QueuePeerConfig struct {
+	Name      string `toml:"name"`
+	URL       string `toml:"url"`
+	TokenFile string `toml:"token_file"`
+}
+
+// QueueExecutorConfig enables the authenticated executor API when Address is set.
+type QueueExecutorConfig struct {
+	Address         string `toml:"address,omitempty"`
+	Instance        string `toml:"instance,omitempty"`
+	TokenFile       string `toml:"token_file,omitempty"`
+	CenterURL       string `toml:"center_url,omitempty"`
+	CenterTokenFile string `toml:"center_token_file,omitempty"`
 }
 
 // WebhookConfig controls the external HTTP webhook endpoint.
@@ -1017,6 +1042,9 @@ func (c *Config) validate() error {
 }
 
 func (c *Config) validateInternal(permissive bool) error {
+	if c.QueueCenter.Address != "" && c.QueueExecutor.Address != "" {
+		return fmt.Errorf("config: queue_center and queue_executor cannot both listen")
+	}
 	if err := validateDisplayConfig("display", &c.Display); err != nil {
 		return err
 	}

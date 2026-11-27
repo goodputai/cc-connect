@@ -112,6 +112,9 @@ type Session struct {
 	retirement        *sync.Map
 	mu                sync.Mutex `json:"-"`
 	busy              bool       `json:"-"`
+	queueTurnStart    time.Time
+	queueTurnSource   string
+	queueItemID       string
 	// historyAdded counts AddHistory calls (not persisted). Unlike
 	// len(History) it keeps growing once the entry cap is reached.
 	historyAdded uint64
@@ -147,9 +150,24 @@ func (s *Session) unlock(update bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.busy = false
+	s.queueTurnStart = time.Time{}
+	s.queueTurnSource, s.queueItemID = "", ""
 	if update {
 		s.UpdatedAt = time.Now()
 	}
+}
+
+func (s *Session) setQueueTurn(start time.Time, sender, itemID string) {
+	source := "human"
+	switch {
+	case itemID != "":
+		source = "center"
+	case sender == "timer" || sender == "cron":
+		source = sender
+	}
+	s.mu.Lock()
+	s.queueTurnStart, s.queueTurnSource, s.queueItemID = start, source, itemID
+	s.mu.Unlock()
 }
 
 func (s *Session) AddHistory(role, content string) {

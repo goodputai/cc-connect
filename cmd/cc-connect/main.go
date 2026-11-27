@@ -1306,6 +1306,10 @@ func main() {
 		if timerSched != nil {
 			apiSrv.SetTimerScheduler(timerSched)
 		}
+		if err := startQueueHTTP(apiSrv, cfg); err != nil {
+			slog.Error("configured queue listener unavailable", "error", err)
+			os.Exit(1)
+		}
 		apiSrv.Start()
 	}
 
@@ -1389,6 +1393,27 @@ func main() {
 	}
 
 	slog.Info("bye")
+}
+
+func startQueueHTTP(api *core.APIServer, cfg *config.Config) error {
+	center := cfg.QueueCenter
+	if center.Address != "" {
+		peers := make([]core.QueuePeerConfig, 0, len(center.Peers))
+		for _, peer := range center.Peers {
+			peers = append(peers, core.QueuePeerConfig{Name: peer.Name, URL: peer.URL, TokenFile: peer.TokenFile})
+		}
+		return api.StartQueueCenter(core.QueueCenterConfig{
+			Address: center.Address, Instance: center.Instance, TokenFile: center.TokenFile, Peers: peers,
+		}, cfg.DataDir)
+	}
+	executor := cfg.QueueExecutor
+	if executor.Address != "" {
+		return api.StartQueueExecutor(core.QueueExecutorConfig{
+			Address: executor.Address, Instance: executor.Instance, TokenFile: executor.TokenFile,
+			CenterURL: executor.CenterURL, CenterTokenFile: executor.CenterTokenFile,
+		})
+	}
+	return nil
 }
 
 func runTopLevelCommand(args []string) bool {

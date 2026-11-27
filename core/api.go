@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,14 +24,16 @@ const DefaultMaxAttachmentSize int64 = 50 << 20
 // APIServer exposes a local Unix socket API for external tools (e.g. cron jobs)
 // to send messages to active sessions.
 type APIServer struct {
-	socketPath string
-	listener   net.Listener
-	server     *http.Server
-	mux        *http.ServeMux
-	engines    map[string]*Engine // project name → engine
-	cron       *CronScheduler
-	timer      *TimerScheduler
-	relay      *RelayManager
+	socketPath  string
+	listener    net.Listener
+	server      *http.Server
+	queueHTTP   *http.Server
+	queueCancel context.CancelFunc
+	mux         *http.ServeMux
+	engines     map[string]*Engine // project name → engine
+	cron        *CronScheduler
+	timer       *TimerScheduler
+	relay       *RelayManager
 	// maxAttachmentBytes caps the raw size of a single attachment accepted by
 	// /send; the request body limit in handleSend is derived from it (base64
 	// expansion + envelope). Defaults to DefaultMaxAttachmentSize.
@@ -193,6 +196,12 @@ func (s *APIServer) Start() {
 }
 
 func (s *APIServer) Stop() {
+	if s.queueHTTP != nil {
+		s.queueCancel()
+		if err := s.queueHTTP.Close(); err != nil && err != http.ErrServerClosed {
+			slog.Debug("queue HTTP server close failed", "error", err)
+		}
+	}
 	if s.server != nil {
 		if err := s.server.Close(); err != nil && err != http.ErrServerClosed {
 			slog.Debug("api server close failed", "error", err)

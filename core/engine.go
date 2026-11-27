@@ -3892,6 +3892,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	}
 
 	turnStart := time.Now()
+	session.setQueueTurn(turnStart, msg.UserID, "")
 	if first := session.FirstInput(); first != nil && first.State != "accepted" {
 		if first.State != "pending" {
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgRotationUncertain))
@@ -6389,6 +6390,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				segmentStart = 0
 				toolCount = 0
 				turnStart = time.Now()
+				session.setQueueTurn(turnStart, queued.userID, "")
 				firstEventLogged = false
 				waitStart = time.Now()
 				// Reassign the local replyCtx parameter to the queued message's
@@ -6800,7 +6802,9 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		}
 
 		slog.Info("processing queued message", "session", sessionKey)
-		e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, time.Now(), stopTyping, sendDone, queued.replyCtx)
+		started := time.Now()
+		session.setQueueTurn(started, queued.userID, "")
+		e.processInteractiveEvents(state, session, sessions, sessionKey, queued.messageID, started, stopTyping, sendDone, queued.replyCtx)
 		if e.finishScheduledRotation(state, session, sessions, sessionKey, state.workspaceDir, queued.msgSessionKey) {
 			session.Unlock()
 			return true

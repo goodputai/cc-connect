@@ -405,6 +405,26 @@ level = "info" # debug, info, warn, error
 # cors_origins = ["http://localhost:3000"]  # Allowed CORS origins / 允许的 CORS 来源
 
 # =============================================================================
+# Queue center and executor listeners (off when address is empty).
+# Configure one role per process. Keep token values in the referenced files.
+#
+# [queue_center]
+# address = "10.126.126.2:9830"
+# instance = "vps"
+# token_file = "/path/to/center.token"
+# [[queue_center.peers]]
+# name = "henry"
+# url = "http://10.126.126.60:9831"
+# token_file = "/path/to/exec.token"
+#
+# [queue_executor]
+# address = "127.0.0.1:9831"
+# instance = "henry"
+# token_file = "/path/to/exec.token"
+# center_url = "http://127.0.0.1:9830"
+# center_token_file = "/path/to/center.token"
+
+# =============================================================================
 # Hooks (Event Triggers / 事件钩子)
 # =============================================================================
 # Execute shell commands or send HTTP requests when lifecycle events occur.
