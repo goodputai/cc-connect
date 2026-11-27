@@ -368,6 +368,9 @@ type Message struct {
 	topicAdmitted       bool
 	topicRun            *topicRun
 
+	queueItemID string
+	queueTurn   *queueTurnObservation
+
 	rotationState *interactiveState // internal outbox delivery; never resurrect after a lifecycle command
 	SessionKey    string            // unique key for user context, e.g. "feishu:{chatID}:{userID}"
 	Platform      string

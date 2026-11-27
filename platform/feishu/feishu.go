@@ -110,14 +110,15 @@ type replyContext struct {
 	threadID string
 	rootID   string
 
-	messageID       string
-	chatID          string
-	sessionKey      string
-	bootstrapThread bool
-	requesterID     string
-	requesterName   string
-	requesterIsBot  bool
-	groupChat       bool
+	messageID        string
+	chatID           string
+	sessionKey       string
+	bootstrapThread  bool
+	requesterID      string
+	requesterName    string
+	requesterIsBot   bool
+	groupChat        bool
+	recordQueueReply func(string)
 }
 
 type Platform struct {
@@ -3780,7 +3781,7 @@ func (p *Platform) sendNewMessageToChat(ctx context.Context, rc replyContext, ms
 	if rc.chatID == "" {
 		return fmt.Errorf("%s: chatID is empty, cannot send new message", p.tag())
 	}
-	return p.createMessage(ctx, rc.chatID, msgType, content, "send")
+	return p.createMessage(ctx, rc.chatID, msgType, content, "send", rc.recordQueueReply)
 }
 
 func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content string) *larkim.ReplyMessageReqBody {
@@ -3807,12 +3808,23 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 			if !resp.Success() {
 				return fmt.Errorf("%s: reply failed code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
 			}
+			if rc.recordQueueReply != nil && resp.Data != nil && resp.Data.MessageId != nil {
+				rc.recordQueueReply(*resp.Data.MessageId)
+			}
 			return nil
 		})
 	})
 }
 
-func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string) error {
+func (p *Platform) WithQueueReplyTracking(replyCtx any, record func(string)) any {
+	if rc, ok := replyCtx.(replyContext); ok {
+		rc.recordQueueReply = record
+		return rc
+	}
+	return replyCtx
+}
+
+func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string, record ...func(string)) error {
 	req := larkim.NewCreateMessageReqBuilder().
 		ReceiveIdType(larkim.ReceiveIdTypeChatId).
 		Body(larkim.NewCreateMessageReqBodyBuilder().
@@ -3829,6 +3841,9 @@ func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, 
 			}
 			if !resp.Success() {
 				return fmt.Errorf("%s: %s failed code=%d msg=%s", p.tag(), op, resp.Code, resp.Msg)
+			}
+			if len(record) > 0 && record[0] != nil && resp.Data != nil && resp.Data.MessageId != nil {
+				record[0](*resp.Data.MessageId)
 			}
 			return nil
 		})
@@ -4724,6 +4739,9 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 		return nil, fmt.Errorf("%s: send preview: no message ID returned", p.tag())
 	}
 
+	if rc.recordQueueReply != nil && msgID != "" {
+		rc.recordQueueReply(msgID)
+	}
 	return &feishuPreviewHandle{messageID: msgID, chatID: chatID, cardID: cardID}, nil
 }
 

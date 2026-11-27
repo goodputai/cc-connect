@@ -138,7 +138,7 @@ func queueBearerHandler(mux *http.ServeMux, token string) http.Handler {
 	})
 }
 
-func (s *APIServer) startQueueHTTP(address, token string, mux *http.ServeMux) (context.Context, error) {
+func (s *APIServer) startQueueHTTP(address, token string, mux *http.ServeMux, setup func(context.Context)) (context.Context, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil || host == "" || (net.ParseIP(host) != nil && net.ParseIP(host).IsUnspecified()) {
 		return nil, errors.New("queue listener requires an explicit host and port")
@@ -157,6 +157,9 @@ func (s *APIServer) startQueueHTTP(address, token string, mux *http.ServeMux) (c
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}
 	s.queueHTTP, s.queueCancel = server, cancel
+	if setup != nil {
+		setup(ctx)
+	}
 	go func() {
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("queue HTTP server failed", "error", err)
@@ -251,7 +254,7 @@ func (s *APIServer) StartQueueCenter(cfg QueueCenterConfig, dataDir string) erro
 		local := queueFleetNode{cfg.Instance, true, &now, s.queueSessions(cfg.Instance)}
 		apiJSON(w, http.StatusOK, append([]queueFleetNode{local}, fleet.snapshot()...))
 	})
-	ctx, err := s.startQueueHTTP(cfg.Address, token, mux)
+	ctx, err := s.startQueueHTTP(cfg.Address, token, mux, nil)
 	if err != nil {
 		return err
 	}
@@ -264,11 +267,20 @@ func (s *APIServer) StartQueueExecutor(cfg QueueExecutorConfig) error {
 	if err != nil {
 		return err
 	}
+	center, err := newQueueRemote(QueuePeerConfig{URL: cfg.CenterURL, TokenFile: cfg.CenterTokenFile})
+	if err != nil {
+		return fmt.Errorf("queue center: %w", err)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /x/sessions", func(w http.ResponseWriter, r *http.Request) {
 		apiJSON(w, http.StatusOK, s.queueSessions(cfg.Instance))
 	})
-	_, err = s.startQueueHTTP(cfg.Address, token, mux)
+	mux.HandleFunc("POST /x/turns", func(w http.ResponseWriter, r *http.Request) {
+		s.queueTurns.serveTurns(w, r)
+	})
+	_, err = s.startQueueHTTP(cfg.Address, token, mux, func(ctx context.Context) {
+		s.queueTurns = newQueueExecutor(s, ctx, center.reportTurn)
+	})
 	return err
 }
 
@@ -284,8 +296,12 @@ func (s *APIServer) queueSessions(instance string) []queueSession {
 	for name, engine := range engines {
 		for key, row := range engine.queueSessionSnapshot() {
 			row.Instance, row.Project, row.SessionKey = instance, name, key
+			row.Halted, _ = queueGroupHalted(key)
 			result = append(result, row)
 		}
+	}
+	if s.queueTurns != nil {
+		s.queueTurns.applySessions(result)
 	}
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].Project != result[j].Project {

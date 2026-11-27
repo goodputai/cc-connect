@@ -3892,7 +3892,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	}
 
 	turnStart := time.Now()
-	session.setQueueTurn(turnStart, msg.UserID, "")
+	session.setQueueTurn(turnStart, msg.UserID, msg.queueItemID)
 	if first := session.FirstInput(); first != nil && first.State != "accepted" {
 		if first.State != "pending" {
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgRotationUncertain))
@@ -4075,7 +4075,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		sendDone <- err
 	}()
 
-	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx)
+	e.processInteractiveEvents(state, session, sessions, interactiveKey, msg.MessageID, turnStart, stopTyping, sendDone, msg.ReplyCtx, msg.queueTurn)
 	if elapsed := time.Since(sendStart); elapsed >= slowAgentSend {
 		slog.Warn("slow agent send", "elapsed", elapsed, "session", msg.SessionKey, "content_len", len(msg.Content))
 	}
@@ -5047,7 +5047,11 @@ var agentErrorHandlers = []agentErrorHandler{
 	{"Session not found", MsgSessionNotFound},
 }
 
-func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any) {
+func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, msgID string, turnStart time.Time, stopTypingFn func(), sendDone <-chan error, replyCtx any, observations ...*queueTurnObservation) {
+	var queueTurn *queueTurnObservation
+	if len(observations) != 0 {
+		queueTurn = observations[0]
+	}
 	defer func() {
 		state.mu.Lock()
 		state.midTurnReady = false
@@ -6259,6 +6263,14 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 			}
 			safeRotation := deliveryErr == nil && !turnSendsFailed.Load() && !unconfirmedPreviewSegment
+			if queueTurn != nil {
+				if safeRotation {
+					queueTurn.finish("done", "", baseResponse)
+				} else {
+					queueTurn.finish("failed", "delivery_unconfirmed", baseResponse)
+				}
+				queueTurn = nil
+			}
 			if !isSilent && e.tts != nil && e.tts.Enabled && e.tts.TTS != nil {
 				safeRotation = false
 			}

@@ -29,6 +29,7 @@ type APIServer struct {
 	server      *http.Server
 	queueHTTP   *http.Server
 	queueCancel context.CancelFunc
+	queueTurns  *queueExecutor
 	mux         *http.ServeMux
 	engines     map[string]*Engine // project name → engine
 	cron        *CronScheduler
