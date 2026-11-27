@@ -361,6 +361,7 @@ type Engine struct {
 	rotationGeneration    map[string]uint64
 	rotationMu            sync.Mutex
 	rotationWorkers       map[string]bool
+	rotationAlert         func(sessionKey, text string)
 	sessionSpawnMu        sync.Mutex
 	name                  string
 	agent                 Agent
@@ -1649,15 +1650,16 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		if workspaceDir != "" {
 			iKey = workspaceDir + ":" + iKey
 		}
-		prevHistLen := session.HistoryLen()
+		prevHistAdded := session.HistoryAddedCount()
 		e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, runSessionKey)
 		e.cleanupInteractiveState(iKey)
 		// Empty-response detection via session history delta: processInteractiveMessageWith
-		// always adds a "user" entry (prevHistLen+1), then an "assistant" entry on success
-		// (prevHistLen+2). This approach correctly detects empty responses across all
+		// always adds a "user" entry (+1), then an "assistant" entry on success
+		// (+2). HistoryAddedCount is used rather than HistoryLen because the
+		// stored history is capped at historyMaxEntries. This approach correctly detects empty responses across all
 		// delivery modes (plain text, cards, rich cards, DingTalk AI streaming) because
 		// AddHistory("assistant",...) is called before any platform-specific rendering path.
-		if !job.Mute && session.HistoryLen() < prevHistLen+2 {
+		if !job.Mute && session.HistoryAddedCount() < prevHistAdded+2 {
 			return fmt.Errorf("cron job %q produced an empty response", job.ID)
 		}
 		return nil
@@ -1672,10 +1674,10 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		return e.queueScheduledForBusySession(effectivePlatform, msg, session, sessions, iKey, agent, workspaceDir)
 	}
 
-	prevHistLen := session.HistoryLen()
+	prevHistAdded := session.HistoryAddedCount()
 	e.processInteractiveMessageWith(effectivePlatform, msg, session, agent, sessions, iKey, workspaceDir, sessionKey)
 	// Same empty-response detection as the useNewSession path above.
-	if !job.Mute && session.HistoryLen() < prevHistLen+2 {
+	if !job.Mute && session.HistoryAddedCount() < prevHistAdded+2 {
 		return fmt.Errorf("cron job %q produced an empty response", job.ID)
 	}
 	return nil
@@ -1879,7 +1881,13 @@ var ErrQueuedForBusySession = errors.New("session busy; prompt queued for the ru
 // prompts. It returns ErrQueuedForBusySession on success and the old
 // "is busy" error only when the queue itself refuses (dead agent, queue full).
 func (e *Engine) queueScheduledForBusySession(p Platform, msg *Message, session *Session, sessions *SessionManager, iKey string, agent Agent, workspaceDir string) error {
-	if !e.queueMessageForBusySession(p, msg, iKey) {
+	switch e.queueMessageForBusySessionResult(p, msg, iKey) {
+	case busyQueueQueued:
+	case busyQueueDropped:
+		// Queue full (or stale): the prompt is NOT in the queue, so the
+		// scheduler must see a failure instead of counting it as delivered.
+		return fmt.Errorf("session %q is busy and its queue refused the prompt", msg.SessionKey)
+	default:
 		return fmt.Errorf("session %q is busy", msg.SessionKey)
 	}
 	// Same race guard as the platform path: the drain loop may have finished
@@ -3273,11 +3281,27 @@ func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions 
 // the event loop sends it after the current turn's EventResult is received.
 // Returns true if the message was successfully queued, false otherwise.
 func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiveKey string) bool {
+	return e.queueMessageForBusySessionResult(p, msg, interactiveKey) != busyQueueRejected
+}
+
+// busyQueueResult distinguishes "appended to the queue" from "handled without
+// queueing" (queue full / stale message: a reply or log was emitted). Platform
+// messages treat both as handled; scheduled prompts must only report delivery
+// when the prompt is actually in the queue.
+type busyQueueResult int
+
+const (
+	busyQueueRejected busyQueueResult = iota
+	busyQueueQueued
+	busyQueueDropped
+)
+
+func (e *Engine) queueMessageForBusySessionResult(p Platform, msg *Message, interactiveKey string) busyQueueResult {
 	e.interactiveMu.Lock()
 	state, hasState := e.interactiveStates[interactiveKey]
 	if !hasState || state == nil {
 		e.interactiveMu.Unlock()
-		return false
+		return busyQueueRejected
 	}
 	// Keep interactiveMu until state.mu is held. Otherwise a starting session can
 	// replace a placeholder state between lookup and queue append, losing the
@@ -3289,7 +3313,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	// Allow queueing when agentSession is nil (session is starting up,
 	// issue #565). Only reject if the session was established and died.
 	if state.agentSession != nil && !state.agentSession.Alive() {
-		return false
+		return busyQueueRejected
 	}
 
 	// Only queue metadata — do NOT send to agent stdin yet.
@@ -3300,12 +3324,12 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	if e.isStaleUserMessageLocked(state, msg.UserMessageTimeMs) {
 		snap := userMessageWatermarkSnapshotLocked(state)
 		e.logStaleUserMessageDropped("reject_before_queue", msg, interactiveKey, snap)
-		return true
+		return busyQueueDropped
 	}
 	if len(state.pendingMessages) >= e.maxQueuedMessages {
 		depth := len(state.pendingMessages)
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgQueueFull), depth))
-		return true // handled: queue-full reply sent
+		return busyQueueDropped // handled: queue-full reply sent
 	}
 	state.pendingMessages = append(state.pendingMessages, queuedMessage{
 		topicGoalSet:        msg.topicGoalSet,
@@ -3348,7 +3372,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	} else {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
 	}
-	return true
+	return busyQueueQueued
 }
 
 // ensureInteractiveStateForQueueing creates a placeholder interactiveState
@@ -3392,26 +3416,29 @@ func (e *Engine) drainOrphanedQueue(session *Session, sessions *SessionManager, 
 	state, hasState := e.interactiveStates[interactiveKey]
 	e.interactiveMu.Unlock()
 
-	if !hasState || state == nil || state.agentSession == nil || !state.agentSession.Alive() {
+	recovering := false
+	if hasState && state != nil {
+		state.mu.Lock()
+		recovering = state.rotationRecovery && !state.stopped && len(state.pendingMessages) > 0
+		state.mu.Unlock()
+	}
+	// A dead process whose queue was retained for --resume is recovered by
+	// drainPendingMessages; only drop when there is nothing to recover.
+	if !recovering && (!hasState || state == nil || state.agentSession == nil || !state.agentSession.Alive()) {
 		if hasState && state != nil {
 			e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent session ended"))
 		}
 		return
 	}
 
-	// Stop unsolicited reader before draining — drainPendingMessages reads
-	// from Events() and we must not have concurrent readers.
-	e.stopUnsolicitedReader(state)
+	// The unsolicited reader is (re)started here, while the session lock is
+	// held, and never after drainPendingMessages returns: by then the lock may
+	// be released and a new foreground turn may already own Events().
+	// drainPendingMessages stops the reader before each queued turn and
+	// restarts it (still locked) after each one.
+	e.restartUnsolicitedReaderIfClean(state, session, sessions, interactiveKey)
 
 	unlocked = e.drainPendingMessages(state, session, sessions, interactiveKey)
-
-	// Restart unsolicited reader if the session is still alive and clean.
-	state.mu.Lock()
-	alive := state.agentSession != nil && state.agentSession.Alive() && !state.stopped && !state.eventsNeedResync
-	state.mu.Unlock()
-	if alive {
-		e.startUnsolicitedReader(state, session, sessions, interactiveKey, workspaceDir)
-	}
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -5146,6 +5173,13 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		turnDeadlineCh = turnDeadlineTimer.C
 	}
 
+	// Pending-rotation stall check: fires rotationTurnStallTimeout after the
+	// last event; only ends the turn if a session switch is pending.
+	stallTimeout := time.Duration(rotationTurnStallTimeout.Load())
+	lastEventAt := time.Now()
+	rotationStallTimer := time.NewTimer(stallTimeout)
+	defer rotationStallTimer.Stop()
+
 	events := state.agentSession.Events()
 	stopCh := state.stopSignal()
 	for {
@@ -5155,6 +5189,28 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		select {
 		case <-stopCh:
 			sp.discard()
+			return
+		case <-rotationStallTimer.C:
+			if quiet := time.Since(lastEventAt); quiet < stallTimeout {
+				rotationStallTimer.Reset(stallTimeout - quiet)
+				continue
+			}
+			if _, pending := sessions.PendingRotation(sessions.KeyForSession(session.ID), session.ID); !pending {
+				rotationStallTimer.Reset(stallTimeout)
+				continue
+			}
+			slog.Error("foreground turn stalled with a pending session switch; ending turn so the switch can converge",
+				"session_key", sessionKey, "stall_timeout", stallTimeout, "elapsed", time.Since(turnStart))
+			cp.Finalize(ProgressCardStateFailed)
+			sp.discard()
+			state.mu.Lock()
+			state.eventsNeedResync = true
+			p := state.platform
+			state.mu.Unlock()
+			e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "agent turn stalled while a session switch is pending"))
+			if !e.retainQueueForResume(sessionKey, state) {
+				e.cleanupInteractiveState(sessionKey, state)
+			}
 			return
 		case event, ok = <-events:
 			if !ok {
@@ -5266,6 +5322,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		}
 
 		// Reset idle timer after receiving an event
+		lastEventAt = time.Now()
 		if idleTimer != nil {
 			if !idleTimer.Stop() {
 				select {
@@ -5827,6 +5884,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			sp.unfreeze()
 
 			// Restart idle timer after permission is resolved
+			lastEventAt = time.Now()
 			if idleTimer != nil {
 				idleTimer.Reset(e.eventIdleTimeout)
 			}
@@ -6386,6 +6444,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				// initial AddHistory("user",...) save above).
 				sessions.Save()
 
+				lastEventAt = time.Now()
 				if idleTimer != nil {
 					if !idleTimer.Stop() {
 						select {
@@ -6469,8 +6528,10 @@ channelClosed:
 	state.mu.Lock()
 	state.eventsNeedResync = true
 	state.mu.Unlock()
-	e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent process exited"))
-	e.cleanupInteractiveState(sessionKey, state)
+	if !e.retainQueueForResume(sessionKey, state) {
+		e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent process exited"))
+		e.cleanupInteractiveState(sessionKey, state)
+	}
 
 	if len(textParts) > 0 {
 		state.mu.Lock()
@@ -6575,6 +6636,53 @@ func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen in
 	return steps
 }
 
+// retainQueueForResume handles an agent process that died (e.g. was killed
+// externally) while user messages are still queued behind the current turn.
+// Instead of dropping the queue, it detaches the dead process and marks the
+// state for queue recovery — the same state performRotation's fail path leaves
+// behind — so the foreground owner's drainPendingMessages hands the next queued
+// message to processRotationFailureQueue, whose processInteractiveMessageWith
+// starts a new process with --resume of the session's agent session ID and
+// adopts the rest of the queue. Returns false (caller drops the queue and
+// cleans up as before) when the queue is empty or the state was replaced.
+func (e *Engine) retainQueueForResume(sessionKey string, state *interactiveState) bool {
+	e.interactiveMu.Lock()
+	if e.interactiveStates[sessionKey] != state {
+		e.interactiveMu.Unlock()
+		return false
+	}
+	state.mu.Lock()
+	if state.stopped || len(state.pendingMessages) == 0 {
+		state.mu.Unlock()
+		e.interactiveMu.Unlock()
+		return false
+	}
+	dead := state.agentSession
+	state.agentSession = nil
+	state.rotationRecovery = true
+	state.eventsNeedResync = true
+	if state.agentSessionIdleCancel != nil {
+		state.agentSessionIdleCancel()
+		state.agentSessionIdleCancel = nil
+	}
+	pending := state.pending
+	state.pending = nil
+	queued := len(state.pendingMessages)
+	state.mu.Unlock()
+	e.interactiveMu.Unlock()
+
+	e.stopUnsolicitedReader(state)
+	if pending != nil {
+		pending.resolve()
+	}
+	if dead != nil {
+		e.closeAgentSessionWithTimeout(sessionKey, dead)
+	}
+	slog.Warn("agent process exited with queued messages; retaining queue for --resume",
+		"session_key", sessionKey, "queued", queued)
+	return true
+}
+
 // notifyDroppedQueuedMessages drains pendingMessages from the state and
 // sends an error notification to each queued message's sender. Called when
 // the event loop exits abnormally (EventError, channel closed) and queued
@@ -6594,15 +6702,16 @@ func (e *Engine) notifyDroppedQueuedMessages(state *interactiveState, reason err
 // state.mu) to close the race window between "queue empty" and "session unlocked".
 // Returns true if the session was unlocked by this call.
 func (e *Engine) drainPendingMessages(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string) bool {
-	state.mu.Lock()
-	recoverQueue := state.rotationRecovery && !state.stopped && len(state.pendingMessages) > 0
-	state.mu.Unlock()
-	if recoverQueue && e.processRotationFailureQueue(state, session, sessions, sessionKey) {
-		return true
-	}
-
 	rotationTried := false
 	for {
+		// Checked every iteration: a queued turn below can lose its agent process
+		// (external kill), which retains the queue for a --resume'd process.
+		state.mu.Lock()
+		recoverQueue := state.rotationRecovery && !state.stopped && len(state.pendingMessages) > 0
+		state.mu.Unlock()
+		if recoverQueue && e.processRotationFailureQueue(state, session, sessions, sessionKey) {
+			return true
+		}
 		e.rotationMu.Lock()
 		if _, pending := sessions.PendingRotation(sessions.KeyForSession(session.ID), session.ID); pending && !rotationTried {
 			e.rotationMu.Unlock()
@@ -6662,6 +6771,12 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			return false
 		}
 
+		// The caller may have started the unsolicited reader before draining.
+		// It must not keep reading Events() during this foreground turn: it would
+		// consume the turn's EventResult, relay it as an "unsolicited turn", and
+		// leave processInteractiveEvents below waiting forever with the session
+		// locked (every later message/cron/timer then sees "is busy").
+		e.stopUnsolicitedReader(state)
 		e.drainAgentEvents(state, session, sessions, sessionKey)
 
 		session.AddHistory("user", queued.content)
@@ -6690,6 +6805,24 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			session.Unlock()
 			return true
 		}
+		// Hand Events() back to the unsolicited reader while the session lock is
+		// still held, so no foreground turn can be reading concurrently; the next
+		// iteration (or the next turn) stops it again before sending.
+		e.restartUnsolicitedReaderIfClean(state, session, sessions, sessionKey)
+	}
+}
+
+// restartUnsolicitedReaderIfClean starts the unsolicited reader when the agent
+// is alive with a clean Events() channel and no reader is running yet. Callers
+// must hold the session lock so no foreground turn reads Events() concurrently.
+func (e *Engine) restartUnsolicitedReaderIfClean(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string) {
+	state.mu.Lock()
+	alive := state.agentSession != nil && state.agentSession.Alive() && !state.stopped && !state.eventsNeedResync
+	running := state.unsolicitedCancel != nil
+	workspaceDir := state.workspaceDir
+	state.mu.Unlock()
+	if alive && !running {
+		e.startUnsolicitedReader(state, session, sessions, sessionKey, workspaceDir)
 	}
 }
 

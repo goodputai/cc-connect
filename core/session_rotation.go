@@ -2,11 +2,9 @@ package core
 
 import (
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -90,6 +88,7 @@ func (sm *SessionManager) snapshotLocked() sessionSnapshot {
 	for k, v := range sm.activeSession {
 		snap.ActiveSession[k] = v
 	}
+	boundHistories(snap.Sessions, snap.ActiveSession, time.Now())
 	for k, v := range sm.userSessions {
 		snap.UserSessions[k] = append([]string(nil), v...)
 	}
@@ -102,7 +101,12 @@ func (sm *SessionManager) snapshotLocked() sessionSnapshot {
 			snap.UserMeta[k] = &cp
 		}
 	}
+	rotationCutoff := time.Now().Add(-rotationRetention)
 	for k, v := range sm.rotations {
+		// Terminal records only serve status lookups; SCHEDULED ones are live.
+		if v.Status != "SCHEDULED" && !v.CreatedAt.IsZero() && v.CreatedAt.Before(rotationCutoff) {
+			continue
+		}
 		cp := *v
 		snap.Rotations[k] = &cp
 	}
@@ -122,23 +126,6 @@ func (sm *SessionManager) snapshotLocked() sessionSnapshot {
 		}
 	}
 	return snap
-}
-
-func (sm *SessionManager) writeSnapshotLocked(snap sessionSnapshot) error {
-	if sm.storePath == "" {
-		return nil
-	}
-	data, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal sessions: %w", err)
-	}
-	if err = os.MkdirAll(filepath.Dir(sm.storePath), 0755); err != nil {
-		return fmt.Errorf("create sessions directory: %w", err)
-	}
-	if err = AtomicWriteFile(sm.storePath, data, 0600); err != nil {
-		return fmt.Errorf("commit sessions: %w", err)
-	}
-	return nil
 }
 
 // PrepareRotation persists the latest uncommitted request without mutating the
