@@ -34,6 +34,16 @@ func TestQueueBoardPublicReadsAndWriteAuthentication(t *testing.T) {
 		{"GET", "/v1/queue/items/unknown/events", "", "", "", http.StatusNotFound},
 		{"GET", "/v1/fleet", "", "", "", http.StatusUnauthorized},
 		{"GET", "/v1/fleet", "center-token", "", "", http.StatusOK},
+		// Exemptions follow the matched mux pattern, not a path prefix.
+		{"HEAD", "/v1/queue/items", "", "", "", http.StatusOK},
+		{"OPTIONS", "/v1/queue/items", "", "", "", http.StatusNotFound},
+		{"PUT", "/board", "", "", "", http.StatusNotFound},
+		{"DELETE", itemPath, "", "", "", http.StatusNotFound},
+		{"GET", "/board/", "", "", "", http.StatusNotFound},
+		{"GET", "/board/../v1/queue/items", "", "", "", http.StatusTemporaryRedirect},
+		{"GET", "/board/../v1/fleet", "", "", "", http.StatusUnauthorized},
+		{"POST", "/board/../v1/queue/items", "", "{}", "", http.StatusUnauthorized},
+		{"PATCH", "/v1/queue/items/" + id + "/events", "", patch, "", http.StatusNotFound},
 		{"POST", "/v1/queue/items", "", "{}", "", http.StatusUnauthorized},
 		{"PATCH", itemPath, "", patch, "", http.StatusUnauthorized},
 		{"PATCH", itemPath, "wrong", patch, "", http.StatusUnauthorized},
@@ -53,7 +63,7 @@ func TestQueueBoardPublicReadsAndWriteAuthentication(t *testing.T) {
 			if res.Code != tc.want || !strings.Contains(res.Body.String(), tc.contains) {
 				t.Fatalf("got HTTP %d %q; want HTTP %d containing %q", res.Code, res.Body.String(), tc.want, tc.contains)
 			}
-			if tc.path == "/board" && !strings.HasPrefix(res.Header().Get("Content-Type"), "text/html") {
+			if tc.method == "GET" && tc.path == "/board" && !strings.HasPrefix(res.Header().Get("Content-Type"), "text/html") {
 				t.Fatalf("board Content-Type: %s", res.Header().Get("Content-Type"))
 			}
 		})
