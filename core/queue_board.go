@@ -332,11 +332,11 @@ func (c *queueCenter) patch(id string, req queuePatchRequest) (*queueItem, int, 
 }
 
 type queueFilter struct {
-	board, line, state, instance, sessionKey string
-	limit                                    int
-	after                                    int64
-	since                                    time.Time
-	open, overdue                            bool
+	board, line, state, priority, instance, sessionKey string
+	limit                                              int
+	after                                              int64
+	since                                              time.Time
+	open, overdue                                      bool
 }
 
 func newQueueFilter(q map[string][]string, limit int) (queueFilter, error) {
@@ -347,7 +347,7 @@ func newQueueFilter(q map[string][]string, limit int) (queueFilter, error) {
 		return ""
 	}
 	f := queueFilter{
-		board: get("board"), line: get("line"), state: get("state"), limit: limit,
+		board: get("board"), line: get("line"), state: get("state"), priority: get("priority"), limit: limit,
 		instance: get("instance"), sessionKey: get("session_key"),
 		open: get("open") == "true", overdue: get("overdue") == "true",
 	}
@@ -359,6 +359,12 @@ func newQueueFilter(q map[string][]string, limit int) (queueFilter, error) {
 	}
 	if f.state != "" && !validQueueState(f.state) {
 		return f, errors.New("unknown state filter")
+	}
+	if f.priority != "" && !validQueuePriority(f.priority) {
+		return f, errors.New("unknown priority filter")
+	}
+	if f.priority != "" {
+		f.priority = queuePriority(f.priority)
 	}
 	if s := get("since"); s != "" {
 		var err error
@@ -388,7 +394,7 @@ func newQueueFilter(q map[string][]string, limit int) (queueFilter, error) {
 
 func (f queueFilter) matches(it *queueItem, now time.Time) bool {
 	if (f.board != "" && it.Board != f.board) || (f.line != "" && it.Line != f.line) ||
-		(f.state != "" && it.Status != f.state) || (f.instance != "" && it.Instance != f.instance) ||
+		(f.state != "" && it.Status != f.state) || (f.priority != "" && it.Priority != f.priority) || (f.instance != "" && it.Instance != f.instance) ||
 		(f.sessionKey != "" && it.SessionKey != f.sessionKey) || it.Seq <= f.after ||
 		(!f.since.IsZero() && it.CreatedAt.Before(f.since) && (it.FinishedAt == nil || it.FinishedAt.Before(f.since))) {
 		return false

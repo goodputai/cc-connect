@@ -16,11 +16,20 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/chenhg5/cc-connect/core"
 )
 
 type queueCommandItem struct {
 	ID, State, Result, Board, Line, Title, Due, Owner, Prompt string
 	Seq                                                       int64
+	Executor                                                  *struct{} `json:"executor"`
+	LastError                                                 string    `json:"last_error"`
+	ResolvedBy                                                string    `json:"resolved_by"`
+}
+
+func (it queueCommandItem) displayStatus() string {
+	return core.QueueDisplayStatus(it.State, it.Executor != nil, it.LastError, it.Result, it.ResolvedBy)
 }
 
 type queueCommandClient struct {
@@ -277,7 +286,7 @@ func queueCommand(args []string, out io.Writer) error {
 		return err
 	}
 	for _, row := range rows {
-		fmt.Fprintf(out, "%s %s %s | %s\n", row.Item.ID, row.Item.Line, row.Item.Title, row.Reason)
+		fmt.Fprintf(out, "%s [%s] %s %s | %s\n", row.Item.ID, row.Item.displayStatus(), row.Item.Line, row.Item.Title, row.Reason)
 	}
 	return nil
 }
@@ -339,7 +348,7 @@ func queueCommandList(out io.Writer, client *queueCommandClient, q url.Values, j
 			continue
 		}
 		item := row.item
-		fmt.Fprintf(out, "%s [%s] 截止 %s %s | %s | 负责人 %s\n", item.ID, item.State, item.Due, item.Line, item.Title, item.Owner)
+		fmt.Fprintf(out, "%s [%s] 截止 %s %s | %s | 负责人 %s\n", item.ID, item.displayStatus(), item.Due, item.Line, item.Title, item.Owner)
 	}
 	return nil
 }

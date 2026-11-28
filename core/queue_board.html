@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>队列看板 · cc-connect</title>
+<style>
+:root {
+  color-scheme: light;
+  --paper: #f4f5f7; --surface: #fff; --lane: #ebedf1; --edge: #d9dde5;
+  --ink: #222832; --muted: #596474; --link: #245bb4; --late: #aa291f;
+  font-family: Inter, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--paper); color: var(--ink); font-size: 14px; }
+main { max-width: 1520px; margin: auto; padding: 24px clamp(14px, 3vw, 40px) 34px; }
+h1, h2, h3, p { margin: 0; }
+h1 { font-size: 25px; line-height: 1.3; letter-spacing: -.035em; }
+h2 { font-size: 16px; }
+header { display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+.updated { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.updated.error, .late { color: var(--late); }
+.filters { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; margin-bottom: 16px; }
+label { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 13px; }
+select, .close {
+  font: inherit; color: var(--ink); background: var(--surface); border: 1px solid #cbd1dc;
+  border-radius: 6px; padding: 5px 8px; min-height: 34px;
+}
+select { max-width: min(240px, 70vw); }
+:focus-visible { outline: 2px solid var(--link); outline-offset: 3px; }
+.lanes { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.lane { background: var(--lane); border-radius: 8px; padding: 8px; min-width: 0; }
+.lane h2 { display: flex; align-items: baseline; gap: 8px; padding: 4px 4px 10px; }
+.count { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); font-weight: 500; }
+.cards { display: grid; gap: 8px; align-content: start; }
+.card {
+  display: block; background: var(--surface); color: inherit; text-decoration: none;
+  border: 1px solid #e1e4eb; border-inline-start: 4px solid var(--priority, #929ba9);
+  border-radius: 6px; padding: 9px 10px 10px; box-shadow: 0 1px 1px #1b284011; overflow-wrap: anywhere;
+}
+.card:hover { border-color: #94a5bd; border-inline-start-color: var(--priority, #929ba9); }
+.pP0 { --priority: #d6322a; } .pP1 { --priority: #e18013; }
+.pP2 { --priority: #347ec4; } .pP3 { --priority: #929ba9; }
+.card-top { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 11px; }
+.priority { font-weight: 750; color: #465263; font-variant-numeric: tabular-nums; }
+.badge { padding: 2px 6px; border-radius: 12px; font-weight: 600; }
+.queued { background: #eee8ff; color: #5630ae; }
+.failed { background: #fce9e7; color: #a7251b; }
+.blocked { background: #fff0d8; color: #8d4905; }
+.resolved { background: #e6edf6; color: #2c597d; }
+.delivered { background: #e2f4e9; color: #176235; }
+.card h3 { margin: 5px 0 3px; font-size: 14px; line-height: 1.45; }
+.meta { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+.card p:not(.meta) { font-size: 12px; line-height: 1.45; margin-top: 2px; }
+.empty { padding: 10px 6px; color: var(--muted); font-size: 12px; }
+.bottlenecks { margin-top: 23px; }
+.table-wrap { overflow: auto; background: var(--surface); border: 1px solid var(--edge); border-radius: 7px; margin-top: 8px; }
+table { border-collapse: collapse; width: 100%; text-align: left; font-size: 13px; }
+th, td { padding: 8px 10px; border-bottom: 1px solid var(--edge); vertical-align: top; }
+th { background: #f3f5f8; color: var(--muted); text-align: left; white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+.rank { font-variant-numeric: tabular-nums; white-space: nowrap; }
+a { color: var(--link); text-underline-offset: 3px; }
+dialog { width: min(680px, calc(100vw - 24px)); max-height: 88vh; border: 1px solid var(--edge); border-radius: 10px; background: var(--surface); color: var(--ink); padding: 0; }
+dialog::backdrop { background: #1e2b4270; }
+.dialog-top { position: sticky; top: 0; background: var(--surface); border-bottom: 1px solid var(--edge); padding: 14px 18px; display: flex; align-items: center; gap: 10px; justify-content: space-between; }
+.dialog-top h2 { overflow-wrap: anywhere; }
+.close { cursor: pointer; flex: none; }
+.details { padding: 14px 18px 20px; overflow-wrap: anywhere; }
+.details dl { display: grid; grid-template-columns: auto 1fr; gap: 7px 14px; margin: 0; }
+.details dt, .timeline time { color: var(--muted); }
+.details dd { margin: 0; }
+.details section { margin-top: 17px; }
+.details h3 { font-size: 14px; margin-bottom: 6px; }
+pre { font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+.evidence, .timeline { margin: 0; padding-inline-start: 24px; }
+.evidence li, .timeline li { padding: 4px 0; }
+.timeline time { margin-inline-end: 7px; font-size: 12px; font-variant-numeric: tabular-nums; }
+@media (max-width: 900px) { .lanes { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 540px) { .lanes { grid-template-columns: 1fr; } th, td { padding: 7px; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>队列看板</h1>
+    <p id="updated" class="updated" role="status">正在读取队列…</p>
+  </header>
+  <div class="filters" aria-label="看板筛选">
+    <label>看板 <select id="board"><option value="">全部</option><option>A</option><option>B</option><option>DH</option></select></label>
+    <label>线 <select id="line"><option value="">全部</option></select></label>
+    <label>优先级 <select id="priority"><option value="">全部</option><option>P0</option><option>P1</option><option>P2</option><option>P3</option></select></label>
+  </div>
+  <div id="lanes" class="lanes"></div>
+  <section class="bottlenecks" aria-labelledby="bottleneck-heading">
+    <h2 id="bottleneck-heading">瓶颈</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th scope="col">顺位</th><th scope="col">优先级</th><th scope="col">事项</th><th scope="col">状态</th><th scope="col">排序依据</th></tr></thead>
+        <tbody id="ranked"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<dialog id="dialog" aria-labelledby="item-heading">
+  <div class="dialog-top"><h2 id="item-heading">事项详情</h2><button type="button" class="close" autofocus>关闭</button></div>
+  <div id="details" class="details"></div>
+</dialog>
+<script>
+"use strict";
+
+const states = ["待办", "进行中", "完成", "取消"];
+const filterKeys = ["board", "line", "priority"];
+const allowed = {board: ["", "A", "B", "DH"], priority: ["", "P0", "P1", "P2", "P3"]};
+const byID = id => document.getElementById(id);
+const dialog = byID("dialog");
+const clock = new Intl.DateTimeFormat("zh-CN", {timeZone: "Asia/Shanghai", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false});
+const dateTime = new Intl.DateTimeFormat("zh-CN", {timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false});
+let controller;
+let lineKey, laneKey, rankKey, detailKey;
+
+function el(tag, options = {}, ...content) {
+  const node = document.createElement(tag);
+  Object.assign(node, options);
+  node.append(...content);
+  return node;
+}
+
+function locationParams() {
+  return new URLSearchParams(location.search);
+}
+
+function filters() {
+  const current = locationParams();
+  const params = new URLSearchParams();
+  for (const key of filterKeys) {
+    const value = current.get(key);
+    if (value && (!allowed[key] || allowed[key].includes(value))) params.set(key, value);
+  }
+  return params;
+}
+
+function changeURL(key, value) {
+  const url = new URL(location.href);
+  if (value) url.searchParams.set(key, value);
+  else url.searchParams.delete(key);
+  if (url.href !== location.href) history.pushState(null, "", url);
+}
+
+function title(item) {
+  return item.title || item.prompt?.split("\n", 1)[0] || item.id;
+}
+
+function status(item) {
+  return item.display_status || item.state;
+}
+
+function badges(item) {
+  if (item.result === "阻塞") return item.resolved_by
+    ? [el("span", {className: "badge resolved"}, "阻塞·已解决")]
+    : [el("span", {className: "badge blocked"}, "阻塞·未解决")];
+  const styles = {"排队": "queued", "失败退回": "failed", "交付": "delivered"};
+  return status(item).split("/").slice(1).filter(label => styles[label])
+    .map(label => el("span", {className: "badge " + styles[label]}, label));
+}
+
+function itemLink(id, text, className = "") {
+  const url = new URL(location.href);
+  url.searchParams.set("item", id);
+  const link = el("a", {href: url.pathname + url.search, className}, text);
+  link.dataset.item = id;
+  return link;
+}
+
+function overdue(item) {
+  if (!item.due || !["待办", "进行中"].includes(item.state)) return false;
+  let input = item.due;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(input)) input += "T00:00:00+08:00";
+  else if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(input)) input = input.replace(" ", "T") + ":00+08:00";
+  return Date.parse(input) < Date.now();
+}
+
+function executor(item) {
+  const peer = item.executor;
+  return peer ? [peer.instance, peer.project, peer.session_key].filter(Boolean).join(" / ") : "";
+}
+
+function waiting(value) {
+  return Array.isArray(value) ? value.join("、") : value || "";
+}
+
+function card(item) {
+  const node = itemLink(item.id, "", "card p" + (allowed.priority.includes(item.priority) ? item.priority : ""));
+  node.append(el("div", {className: "card-top"}, el("span", {className: "priority"}, item.priority), ...badges(item)),
+    el("h3", {}, title(item)), el("p", {className: "meta"}, [item.line, item.id].filter(Boolean).join(" · ")));
+  if (waiting(item.waits_on)) node.append(el("p", {}, "等 " + waiting(item.waits_on)));
+  if (executor(item)) node.append(el("p", {}, "执行方 " + executor(item)));
+  if (item.due) {
+    const late = overdue(item);
+    node.append(el("p", {className: late ? "late" : ""}, "截止 " + item.due + (late ? " · 已超期" : "")));
+  }
+  if (item.last_error) node.append(el("p", {className: "late"}, item.last_error));
+  if (item.evidence?.length) {
+    const characters = Array.from(item.evidence.at(-1));
+    node.append(el("p", {}, "证据 " + characters.slice(0, 52).join("") + (characters.length > 52 ? "…" : "")));
+  }
+  return node;
+}
+
+function renderDashboard(items, ranked, params) {
+  const lines = [...new Set(items.map(item => item.line).filter(Boolean))].sort((a, b) => a.localeCompare(b, "zh-CN"));
+  const chosen = params.get("line") || "";
+  if (chosen && !lines.includes(chosen)) lines.unshift(chosen);
+  const nextLineKey = JSON.stringify(lines);
+  if (lineKey !== nextLineKey) {
+    byID("line").replaceChildren(new Option("全部", ""), ...lines.map(line => new Option(line, line)));
+    lineKey = nextLineKey;
+  }
+  for (const key of filterKeys) byID(key).value = params.get(key) || "";
+  const shown = items.filter(item => (!chosen || item.line === chosen) &&
+    (!params.has("priority") || item.priority === params.get("priority")));
+  const nextLaneKey = JSON.stringify([params.toString(), shown.map(item => [item, overdue(item)])]);
+  if (laneKey !== nextLaneKey) {
+    byID("lanes").replaceChildren(...states.map(state => {
+      const column = shown.filter(item => item.state === state).sort((a, b) => a.priority.localeCompare(b.priority) || a.seq - b.seq);
+      return el("section", {className: "lane"},
+        el("h2", {}, state, el("span", {className: "count"}, String(column.length))),
+        el("div", {className: "cards"}, ...(column.length ? column.map(card) : [el("p", {className: "empty"}, "暂无条目")])));
+    }));
+    laneKey = nextLaneKey;
+  }
+  const nextRankKey = JSON.stringify([params.toString(), ranked.map(row => [row.item.revision, row.item.id, Math.floor(row.wait_seconds / 60), row.dependent_ids])]);
+  if (rankKey !== nextRankKey) {
+    byID("ranked").replaceChildren(...(ranked.length ? ranked.map((row, i) => el("tr", {},
+      el("td", {className: "rank"}, String(i + 1)), el("td", {}, row.item.priority),
+      el("td", {}, itemLink(row.item.id, title(row.item))), el("td", {}, status(row.item)),
+      el("td", {}, "被依赖 " + row.dependent_ids.length + " 条 · 已卡 " + Math.floor(row.wait_seconds / 60) + " 分钟")))
+      : [el("tr", {}, el("td", {colSpan: 5, className: "empty"}, "暂无瓶颈"))]));
+    rankKey = nextRankKey;
+  }
+}
+
+function refs(value) {
+  const values = Array.isArray(value) ? value : value ? [value] : [];
+  return values.flatMap((entry, i) => {
+    const ref = Array.isArray(value) || /^q_[a-z0-9_-]+$/i.test(entry) ? itemLink(entry, entry) : entry;
+    return i ? ["、", ref] : [ref];
+  });
+}
+
+function renderDetail(item, events) {
+  byID("item-heading").textContent = title(item);
+  const pairs = [
+    ["条目", item.id], ["状态", status(item)], ["优先级", item.priority],
+    ["看板", item.board], ["线", item.line], ["截止", item.due],
+    ["执行方", executor(item)], ["等待", ...refs(item.waits_on)],
+    ["接续", ...(item.follows ? [itemLink(item.follows, item.follows)] : [])],
+    ["由此解决", ...(item.resolved_by ? [itemLink(item.resolved_by, item.resolved_by)] : [])],
+    ["失败原因", item.last_error], ["原因", item.reason],
+  ];
+  const facts = el("dl", {}, ...pairs.filter(row => row.slice(1).some(Boolean))
+    .flatMap(([name, ...value]) => [el("dt", {}, name), el("dd", {}, ...value)]));
+  const evidence = item.evidence || [];
+  const timeline = events.map(event => el("li", {},
+    el("time", {dateTime: event.at}, dateTime.format(new Date(event.at))), event.state + " · " + event.note));
+  byID("details").replaceChildren(
+    facts,
+    el("section", {}, el("h3", {}, "提示词"), el("pre", {}, item.prompt || "无")),
+    el("section", {}, el("h3", {}, "证据"), evidence.length
+      ? el("ol", {className: "evidence"}, ...evidence.map(text => el("li", {}, el("pre", {}, text)))) : el("p", {}, "暂无证据")),
+    el("section", {}, el("h3", {}, "事件时间线"), timeline.length
+      ? el("ol", {className: "timeline"}, ...timeline) : el("p", {}, "暂无事件")));
+}
+
+async function loadJSON(path, signal) {
+  const response = await fetch(path, {signal, cache: "no-store"});
+  if (!response.ok) throw new Error("HTTP " + response.status);
+  return response.json();
+}
+
+async function loadItems(params, signal) {
+  const query = new URLSearchParams({limit: "1000"});
+  if (params.has("board")) query.set("board", params.get("board"));
+  const items = [];
+  for (;;) {
+    const rows = await loadJSON("/v1/queue/items?" + query, signal);
+    items.push(...rows.filter(item => item.kind !== "completion"));
+    if (rows.length < 1000) return items;
+    query.set("after", rows.at(-1).seq);
+  }
+}
+
+async function updateBoard(params, signal) {
+  const updated = byID("updated");
+  try {
+    const [items, ranked] = await Promise.all([
+      loadItems(params, signal),
+      loadJSON("/v1/queue/bottleneck?" + params, signal)
+    ]);
+    if (signal.aborted) return;
+    renderDashboard(items, ranked, params);
+    updated.textContent = "更新于 " + clock.format(new Date()) + "（北京时间）";
+    updated.classList.remove("error");
+  } catch (error) {
+    if (signal.aborted) return;
+    updated.textContent = "刷新失败，稍后重试（" + error.message + "）";
+    updated.classList.add("error");
+  }
+}
+
+async function updateDetail(id, signal) {
+  if (!id) return;
+  const path = "/v1/queue/items/" + encodeURIComponent(id);
+  try {
+    const [item, events] = await Promise.all([loadJSON(path, signal), loadJSON(path + "/events", signal)]);
+    if (signal.aborted) return;
+    const nextKey = JSON.stringify([item, events]);
+    if (detailKey !== nextKey) {
+      renderDetail(item, events);
+      detailKey = nextKey;
+    }
+  } catch (error) {
+    if (signal.aborted) return;
+    detailKey = null;
+    byID("details").textContent = "无法读取此事项（" + error.message + "）";
+  }
+}
+
+function refresh(navigate = false) {
+  if (controller && !navigate) return;
+  controller?.abort();
+  const request = new AbortController();
+  controller = request;
+  const id = locationParams().get("item");
+  Promise.all([updateBoard(filters(), request.signal), updateDetail(id, request.signal)]).finally(() => {
+    if (controller === request) controller = null;
+  });
+}
+
+function navigate() {
+  const params = filters();
+  for (const key of ["board", "priority"]) byID(key).value = params.get(key) || "";
+  const id = locationParams().get("item");
+  if (id) {
+    detailKey = null;
+    byID("item-heading").textContent = "事项详情";
+    byID("details").textContent = "正在读取 " + id + "…";
+    if (!dialog.open) dialog.showModal();
+  } else if (dialog.open) {
+    dialog.close();
+  }
+  refresh(true);
+}
+
+for (const key of filterKeys) {
+  byID(key).addEventListener("change", event => {
+    changeURL(key, event.target.value);
+    refresh(true);
+  });
+}
+document.addEventListener("click", event => {
+  const link = event.target.closest("a[data-item]");
+  if (!link || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  changeURL("item", link.dataset.item);
+  navigate();
+});
+dialog.querySelector(".close").addEventListener("click", () => dialog.close());
+dialog.addEventListener("close", () => {
+  if (locationParams().has("item")) {
+    changeURL("item", "");
+    refresh(true);
+  }
+});
+window.addEventListener("popstate", navigate);
+navigate();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

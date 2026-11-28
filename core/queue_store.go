@@ -51,6 +51,7 @@ func (c *queueCenter) commitLocked(note string, items ...*queueItem) error {
 		return err
 	}
 	for _, it := range items {
+		c.indexEvent(event, it)
 		c.indexItem(it)
 		if err := c.writeItem(it); err != nil {
 			// The journal already committed the change. Startup repairs any
@@ -202,6 +203,7 @@ func (c *queueCenter) replayEvents() error {
 			if it == nil || !validQueueItemID(it.ID) || !validQueueState(it.Status) {
 				return fmt.Errorf("invalid queue change at byte %d", offset)
 			}
+			c.indexEvent(event, it)
 			prior := c.items[it.ID]
 			if prior == nil || prior.Revision < it.Revision {
 				c.indexItem(it)

@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -125,10 +126,16 @@ func (p *queueRemote) fetchSessions(ctx context.Context) ([]queueSession, error)
 	return sessions, nil
 }
 
-func queueBearerHandler(mux *http.ServeMux, token string) http.Handler {
+func queueBearerHandler(mux *http.ServeMux, token string, public ...string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, pattern := mux.Handler(r); pattern == "" {
+		_, pattern := mux.Handler(r)
+		if pattern == "" {
 			http.NotFound(w, r)
+			return
+		}
+		if slices.Contains(public, pattern) {
+			w.Header().Set("Cache-Control", "no-store")
+			mux.ServeHTTP(w, r)
 			return
 		}
 		value, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -141,7 +148,7 @@ func queueBearerHandler(mux *http.ServeMux, token string) http.Handler {
 	})
 }
 
-func (s *APIServer) startQueueHTTP(address, token string, mux *http.ServeMux, setup func(context.Context)) (context.Context, error) {
+func (s *APIServer) startQueueHTTP(address string, handler http.Handler, setup func(context.Context)) (context.Context, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil || host == "" || (net.ParseIP(host) != nil && net.ParseIP(host).IsUnspecified()) {
 		return nil, errors.New("queue listener requires an explicit host and port")
@@ -152,7 +159,7 @@ func (s *APIServer) startQueueHTTP(address, token string, mux *http.ServeMux, se
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	server := &http.Server{
-		Handler:           queueBearerHandler(mux, token),
+		Handler:           handler,
 		ReadHeaderTimeout: queueHTTPTimeout,
 		ReadTimeout:       queueHTTPTimeout,
 		WriteTimeout:      2 * queueHTTPTimeout,
@@ -294,7 +301,7 @@ func (s *APIServer) StartQueueCenter(cfg QueueCenterConfig, dataDir string) erro
 		apiJSON(w, http.StatusOK, nodes)
 	})
 	center.register(mux)
-	ctx, err := s.startQueueHTTP(cfg.Address, token, mux, func(ctx context.Context) {
+	ctx, err := s.startQueueHTTP(cfg.Address, queueCenterHandler(mux, token), func(ctx context.Context) {
 		// Local sessions use the same executor path as remote ones; their
 		// reports go straight to the center.
 		s.queueTurns = newQueueExecutor(s, ctx, func(_ context.Context, itemID, event string, body queueTurnReport) error {
@@ -353,7 +360,7 @@ func (s *APIServer) StartQueueExecutor(cfg QueueExecutorConfig) error {
 	mux.HandleFunc("POST /x/turns", func(w http.ResponseWriter, r *http.Request) {
 		s.queueTurns.serveTurns(w, r)
 	})
-	_, err = s.startQueueHTTP(cfg.Address, token, mux, func(ctx context.Context) {
+	_, err = s.startQueueHTTP(cfg.Address, queueBearerHandler(mux, token), func(ctx context.Context) {
 		s.queueTurns = newQueueExecutor(s, ctx, center.reportTurn)
 	})
 	return err
@@ -456,6 +463,7 @@ func (p *queueRemote) startTurn(ctx context.Context, req queueTurnRequest) (queu
 }
 
 func (c *queueCenter) register(mux *http.ServeMux) {
+	c.registerBoard(mux)
 	fail := func(w http.ResponseWriter, status int, err error) { http.Error(w, err.Error(), status) }
 	mux.HandleFunc("POST /v1/queue/items", func(w http.ResponseWriter, r *http.Request) {
 		var req queueEnqueueRequest

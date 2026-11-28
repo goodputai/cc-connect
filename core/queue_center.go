@@ -81,9 +81,9 @@ type queueItem struct {
 	WaitsSince         *time.Time    `json:"waits_since,omitempty"`
 	Evidence           []string      `json:"evidence,omitempty"`
 	LastError          string        `json:"last_error,omitempty"`
-	Result             string        `json:"result,omitempty"`
+	Result             string        `json:"result"`
 	Follows            string        `json:"follows,omitempty"`
-	ResolvedBy         string        `json:"resolved_by,omitempty"`
+	ResolvedBy         string        `json:"resolved_by"`
 	Status             string        `json:"state"`
 	Reason             string        `json:"reason,omitempty"`
 	Seq                int64         `json:"seq"`
@@ -106,8 +106,9 @@ func (it *queueItem) MarshalJSON() ([]byte, error) {
 	type item queueItem
 	return json.Marshal(struct {
 		*item
-		Status string `json:"status"`
-	}{(*item)(it), it.Status})
+		Status        string `json:"status"`
+		DisplayStatus string `json:"display_status"`
+	}{(*item)(it), it.Status, QueueDisplayStatus(it.Status, it.Executor != nil, it.LastError, it.Result, it.ResolvedBy)})
 }
 
 func (it *queueItem) lane() string {
@@ -215,6 +216,7 @@ type queueCenter struct {
 	mu       sync.Mutex
 	seq      int64
 	items    map[string]*queueItem
+	events   map[string][]queueItemEvent
 	keys     map[string]string
 	wakes    map[string][]time.Time
 	inflight map[string]bool
@@ -232,6 +234,7 @@ func newQueueCenter(dir string) (*queueCenter, error) {
 		spawn:           func(f func()) { go f() },
 		kick:            make(chan struct{}, 1),
 		items:           make(map[string]*queueItem),
+		events:          make(map[string][]queueItemEvent),
 		keys:            make(map[string]string),
 		wakes:           make(map[string][]time.Time),
 		inflight:        make(map[string]bool),
